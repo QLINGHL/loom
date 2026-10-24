@@ -14,6 +14,7 @@
 pub mod capabilities;
 pub mod crypto;
 pub mod taint;
+pub mod tools;
 pub mod typesys;
 
 use std::cell::Cell;
