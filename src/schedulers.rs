@@ -196,7 +196,7 @@ impl InferenceScheduler {
                 .map(|m| m.name.clone())
                 .expect("at least one model must be able to serve"),
         };
-        let was_resident = self.resident.iter().any(|n| *n == chosen);
+        let was_resident = self.resident.contains(&chosen);
         if was_resident {
             self.resident_hits += 1;
         }
