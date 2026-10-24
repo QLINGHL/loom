@@ -11,7 +11,10 @@
 //! injected [`Clock`] so every time-based rule (capability leases, memory
 //! half-lives, cooling-off periods) is deterministically testable.
 
+pub mod capabilities;
 pub mod crypto;
+pub mod taint;
+pub mod typesys;
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
