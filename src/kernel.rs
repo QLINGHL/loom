@@ -309,6 +309,9 @@ impl Kernel {
 
     // -- Ledger ---------------------------------------------------------------
 
+    // A ledger append genuinely has eight fields to record; bundling them
+    // into a struct would only move the same list one level down.
+    #[allow(clippy::too_many_arguments)]
     fn log(
         &mut self,
         actor: &str,
@@ -495,6 +498,9 @@ impl Kernel {
 
     /// The unique entry point that changes the world. See the module docs
     /// for the exact check order. `step` is (tool, resource, args).
+    // The parameter list mirrors the syscall shape of doc ch. 8 on purpose:
+    // (agent, txn, cap, tool, resource, args, options) is the audit unit.
+    #[allow(clippy::too_many_arguments)]
     pub fn act(
         &mut self,
         agent: &str,

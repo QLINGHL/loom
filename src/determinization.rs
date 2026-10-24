@@ -23,7 +23,7 @@
 //!   interface change invalidates it immediately.
 
 use crate::crypto::sha256_hex;
-use crate::typesys::{Condition, Facts, Plan};
+use crate::typesys::{Facts, Plan};
 use crate::Value;
 use std::collections::{HashMap, HashSet};
 
