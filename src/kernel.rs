@@ -604,6 +604,7 @@ impl Kernel {
     /// Spend a linear (single-use) capability. The wrapper is consumed by
     /// value, so a second spend is a compile error at the call site — the
     /// affine-type enforcement of doc ch. 7's ⊸.
+    #[allow(clippy::too_many_arguments)]
     pub fn act_linear(
         &mut self,
         agent: &str,
