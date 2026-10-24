@@ -14,6 +14,8 @@
 pub mod attention;
 pub mod capabilities;
 pub mod crypto;
+pub mod determinization;
+pub mod kernel;
 pub mod memory;
 pub mod schedulers;
 pub mod speculation;
