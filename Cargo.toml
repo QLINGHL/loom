@@ -1,0 +1,20 @@
+[package]
+name = "loom"
+version = "0.1.0"
+edition = "2021"
+description = "Loom — AI-native OS architecture prototype: capability kernel, effect types, determinization into intent macros, provenance memory, reality cache, attention scheduling"
+license = "MIT"
+
+# Zero external dependencies by design: the build must work fully offline so
+# that daily iteration never breaks on a registry outage. SHA-256 / HMAC are
+# implemented by hand in src/crypto.rs and verified against known-answer
+# test vectors.
+[dependencies]
+
+[lib]
+name = "loom"
+path = "src/lib.rs"
+
+[[bin]]
+name = "demo"
+path = "src/bin/demo.rs"
