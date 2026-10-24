@@ -15,10 +15,13 @@ pub mod attention;
 pub mod capabilities;
 pub mod crypto;
 pub mod memory;
+pub mod schedulers;
+pub mod speculation;
 pub mod taint;
 pub mod tools;
 pub mod transactions;
 pub mod typesys;
+pub mod watchdog;
 pub mod worldcache;
 
 use std::cell::Cell;
