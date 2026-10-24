@@ -13,6 +13,7 @@
 
 pub mod attention;
 pub mod capabilities;
+pub mod concurrency;
 pub mod crypto;
 pub mod determinization;
 pub mod kernel;
