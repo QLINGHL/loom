@@ -11,11 +11,13 @@
 //! injected [`Clock`] so every time-based rule (capability leases, memory
 //! half-lives, cooling-off periods) is deterministically testable.
 
+pub mod attention;
 pub mod capabilities;
 pub mod crypto;
 pub mod memory;
 pub mod taint;
 pub mod tools;
+pub mod transactions;
 pub mod typesys;
 pub mod worldcache;
 
