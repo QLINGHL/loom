@@ -13,9 +13,11 @@
 
 pub mod capabilities;
 pub mod crypto;
+pub mod memory;
 pub mod taint;
 pub mod tools;
 pub mod typesys;
+pub mod worldcache;
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
