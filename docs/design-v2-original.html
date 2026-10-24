@@ -1,0 +1,1055 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loom v2 — AI 原生操作系统架构设计</title>
+<style>
+:root{
+  --bg:#faf9f7; --card:#ffffff; --ink:#191b1f; --ink2:#3d434d; --muted:#6b7280;
+  --line:#e6e2da; --line2:#d5d0c6;
+  --accent:#2b4acb; --accent-soft:#eef1fd; --accent-line:#c3cdf5;
+  --violet:#534ab7; --violet-soft:#eeedfe;
+  --warn:#a45a06; --warn-soft:#fdf4e7;
+  --danger:#b03636; --danger-soft:#fbeeee;
+  --ok:#1a6b4a; --ok-soft:#eaf4ef;
+  --mono:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;
+  --serif:"Songti SC","Source Han Serif SC","Noto Serif SC",Georgia,serif;
+  --sans:-apple-system,"Segoe UI","Microsoft YaHei","PingFang SC",system-ui,sans-serif;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:15.5px;line-height:1.85;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1180px;margin:0 auto;padding:0 32px;display:grid;grid-template-columns:208px minmax(0,1fr);gap:52px}
+@media (max-width:980px){.wrap{grid-template-columns:1fr;gap:0}.toc{display:none}}
+
+header.hero{border-bottom:1px solid var(--line);background:var(--card)}
+header.hero .inner{max-width:1180px;margin:0 auto;padding:60px 32px 48px}
+.kicker{font-size:12.5px;letter-spacing:.16em;color:var(--accent);font-weight:500;margin:0 0 18px}
+h1{font-family:var(--serif);font-size:39px;line-height:1.3;font-weight:600;margin:0 0 16px;letter-spacing:-.01em}
+.lede{font-size:17px;color:var(--ink2);max-width:660px;margin:0 0 26px;line-height:1.8}
+.meta{display:flex;flex-wrap:wrap;gap:8px 10px;font-size:12.5px;color:var(--muted)}
+.meta span{border:1px solid var(--line);border-radius:100px;padding:3px 12px;background:var(--bg)}
+
+.changelog{max-width:1180px;margin:0 auto;padding:0 32px 40px}
+.changelog .box{background:var(--violet-soft);border:1px solid #cdc9f2;border-radius:10px;padding:18px 22px;font-size:14px;line-height:1.75}
+.changelog .box b{color:var(--violet)}
+.changelog ul{margin:8px 0 0;padding-left:20px}
+.changelog li{margin:0 0 5px;color:#3d3a5c}
+
+.toc{position:sticky;top:24px;align-self:start;padding:34px 0;font-size:12.6px;max-height:calc(100vh - 40px);overflow-y:auto}
+.toc p{font-size:11.5px;letter-spacing:.14em;color:var(--muted);margin:0 0 10px}
+.toc a{display:block;color:var(--muted);text-decoration:none;padding:3.5px 0 3.5px 11px;border-left:2px solid transparent;line-height:1.45}
+.toc a:hover{color:var(--accent);border-left-color:var(--accent-line)}
+.toc a.new{color:var(--violet)}
+.toc a.new:hover{border-left-color:#cdc9f2}
+main{padding:32px 0 120px;min-width:0}
+section{scroll-margin-top:20px;margin:0 0 54px}
+h2{font-size:22.5px;font-weight:600;margin:0 0 16px;padding-top:6px;letter-spacing:-.005em}
+h2 .num{color:var(--accent);font-variant-numeric:tabular-nums;margin-right:10px;font-weight:500}
+h2 .badge{font-size:10.5px;letter-spacing:.08em;color:var(--violet);background:var(--violet-soft);border:1px solid #cdc9f2;border-radius:4px;padding:1.5px 7px;margin-left:10px;vertical-align:2px;font-weight:500}
+h3{font-size:16.5px;font-weight:600;margin:30px 0 10px}
+h4{font-size:14.5px;font-weight:600;margin:20px 0 6px;color:var(--ink2)}
+p{margin:0 0 15px}
+ul,ol{margin:0 0 15px;padding-left:22px}
+li{margin:0 0 7px}
+em{font-style:normal;background:linear-gradient(transparent 62%,#dfe5fb 62%);padding:0 1px}
+code{font-family:var(--mono);font-size:.87em;background:#f2f0ea;padding:1.5px 5px;border-radius:4px;color:#3a3f4a}
+a{color:var(--accent)}
+
+.note{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:17px 21px;margin:20px 0;font-size:14.3px}
+.note p:last-child{margin-bottom:0}
+.note .tag{display:inline-block;font-size:11.5px;letter-spacing:.1em;font-weight:600;margin-bottom:5px}
+.note.warn{background:var(--warn-soft);border-color:#f0dcc0}.note.warn .tag{color:var(--warn)}
+.note.danger{background:var(--danger-soft);border-color:#efd2d2}.note.danger .tag{color:var(--danger)}
+.note.ok{background:var(--ok-soft);border-color:#cfe3d8}.note.ok .tag{color:var(--ok)}
+.note.idea{background:var(--accent-soft);border-color:var(--accent-line)}.note.idea .tag{color:var(--accent)}
+.note.prop{background:var(--violet-soft);border-color:#cdc9f2}.note.prop .tag{color:var(--violet)}
+
+table{width:100%;border-collapse:collapse;margin:18px 0 22px;font-size:13.5px;line-height:1.65}
+th{text-align:left;font-weight:600;color:var(--ink2);border-bottom:1.5px solid var(--line2);padding:9px 11px 9px 0;vertical-align:bottom;font-size:12.4px}
+td{border-bottom:1px solid var(--line);padding:10px 11px 10px 0;vertical-align:top;color:var(--ink2)}
+td:first-child{color:var(--ink);font-weight:500}
+tr:last-child td{border-bottom:none}
+
+figure{margin:24px 0 28px}
+figure svg{width:100%;height:auto;display:block}
+figcaption{font-size:12.5px;color:var(--muted);margin-top:11px;padding-left:2px;line-height:1.6}
+figcaption b{color:var(--ink2);font-weight:600}
+
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(228px,1fr));gap:13px;margin:20px 0}
+.mini{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:15px 17px}
+.mini .n{font-family:var(--mono);font-size:11.5px;color:var(--accent);margin-bottom:3px}
+.mini h4{margin:0 0 5px;font-size:14px}
+.mini p{font-size:13.1px;color:var(--muted);margin:0;line-height:1.65}
+
+.axiom{display:flex;gap:15px;padding:14px 0;border-bottom:1px solid var(--line)}
+.axiom:last-child{border-bottom:none}
+.axiom .idx{flex:0 0 28px;font-family:var(--serif);font-size:18px;color:var(--accent-line);line-height:1.5;font-weight:600}
+.axiom .body h4{margin:0 0 3px;font-size:15px}
+.axiom .body p{margin:0;font-size:13.9px;color:var(--muted);line-height:1.7}
+
+pre{background:#1d2027;color:#e6e6e6;padding:15px 19px;border-radius:10px;overflow-x:auto;font-family:var(--mono);font-size:12.5px;line-height:1.75;margin:18px 0}
+pre .c{color:#8b94a6}
+pre .k{color:#8fb3f5}
+pre .r{color:#f0a3a3}
+
+footer{border-top:1px solid var(--line);padding:26px 0 60px;font-size:12.5px;color:var(--muted)}
+footer p{margin:0 0 8px}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="inner">
+    <p class="kicker">架构设计文档 · v2</p>
+    <h1>Loom：一个把大模型当作外设，<br>并且以「减少使用模型」为成功标准的操作系统</h1>
+    <p class="lede">v1 的结论是「AI 提议，内核执行」。v2 往前推了一步：如果这个判断成立，那么一个成熟 AI 操作系统的行为特征应该是——同一个意图每重复一次，就更便宜、更快、更安全一点，直到它完全不需要模型。确定化不是优化，是这类系统唯一的长期出路。</p>
+    <div class="meta">
+      <span>代号 Loom（占位名）</span>
+      <span>2026-10</span>
+      <span>v2 修订</span>
+      <span>范围：端侧为主，端云协同</span>
+    </div>
+  </div>
+</header>
+
+<div class="changelog">
+  <div class="box">
+    <b>v2 变更说明</b>
+    <ul>
+      <li><b>修正了一处根本性错误。</b>v1 说「NPU 算力有限」，这是错的。端侧推理是内存带宽受限（memory-bandwidth-bound），不是算力受限。这个修正改变了整个推理调度器的设计（见第 2、9 章）。</li>
+      <li><b>新增核心命题「确定化」</b>（第 4 章），并把它升为北极星指标。</li>
+      <li><b>新增 11 章</b>：硬件现实、确定化、意图编译器与效果类型、现实缓存、投机执行、注意力拥塞控制、失败分类学、多 Agent 并发、跨设备分布式能力、内核实现路径。</li>
+      <li><b>安全章大幅扩充</b>：负能力、工具供应链签名、记忆投毒工程防御。</li>
+      <li><b>补充了新的事实依据</b>：OSWorld SOTA 已达 90.2%（人类基线 72.36%），说明能力不再是瓶颈；TomasuLLM 的投机执行实测数据；MCP 工具投毒与 Rug Pull 的 CVE 案例。</li>
+    </ul>
+  </div>
+</div>
+
+<div class="wrap">
+<nav class="toc">
+  <p>目录</p>
+  <a href="#s1">1 · 三条路线与天花板</a>
+  <a href="#s2" class="new">2 · 硬件现实：带宽才是约束</a>
+  <a href="#s3">3 · 四种同时变稀缺的资源</a>
+  <a href="#s4" class="new">4 · 核心命题：确定化</a>
+  <a href="#s5">5 · 六条设计公理</a>
+  <a href="#s6">6 · 总体架构</a>
+  <a href="#s7" class="new">7 · 意图编译器与效果类型</a>
+  <a href="#s8">8 · 内核对象与系统调用</a>
+  <a href="#s9">9 · 五个调度器</a>
+  <a href="#s10">10 · 上下文与记忆</a>
+  <a href="#s11" class="new">11 · 现实缓存</a>
+  <a href="#s12" class="new">12 · 投机执行与提交验证</a>
+  <a href="#s13">13 · 安全模型</a>
+  <a href="#s14" class="new">14 · 注意力拥塞控制</a>
+  <a href="#s15">15 · 动作与事务</a>
+  <a href="#s16" class="new">16 · 失败分类学</a>
+  <a href="#s17" class="new">17 · 多 Agent 并发</a>
+  <a href="#s18" class="new">18 · 跨设备分布式能力</a>
+  <a href="#s19">19 · 交互与生态</a>
+  <a href="#s20" class="new">20 · 内核实现路径</a>
+  <a href="#s21">21 · 尚未解决的问题</a>
+  <a href="#s22">22 · 度量体系</a>
+  <a href="#s23">23 · 落地路线</a>
+  <a href="#s24">24 · 战略定位</a>
+</nav>
+
+<main>
+
+<section id="s1">
+<h2><span class="num">01</span>三条路线与各自天花板</h2>
+
+<p>把大模型装进操作系统，目前有三条路，每条都撞到了不同的墙。</p>
+
+<h3>路线 A：把 LLM 当内核</h3>
+<p>代表是 AIOS 这类研究：LLM 视为 CPU、上下文窗口视为内存、工具调用视为系统调用，在应用与模型之间插一层内核做调度与上下文管理。工程价值真实——把上下文管理和调度从各个 agent 框架里抽出来，并发场景下有可观加速。</p>
+<p>但那个类比会误导架构。CPU 是确定性、可抢占、状态可完整保存恢复的；LLM 三条全不成立：输出不可复现，上下文即状态，一次推理中途换出等于重算整个 KV。把 LLM 当 CPU，就会推导出「LLM 上下文切换」这种代价极高、本不该存在的机制。</p>
+<p>更准确的位置：<strong>LLM 是一块高延迟、有损、需要大量随附状态的协处理器</strong>。操作系统的任务是虚拟化它，不是让它当大脑。</p>
+
+<h3>路线 B：把助手塞进系统</h3>
+<p>Copilot+ PC 与各类系统级 Agent 入口。天花板被交互模型锁死：用户仍在「开应用—找文件—点按钮」，AI 只是某个环节的加速器。资源抽象、权限模型、状态单位一个都没变，所以它永远只能是插件。</p>
+
+<h3>路线 C：把权限收进内核</h3>
+<p>2025 年之后最有价值的一步。微软的 ACS / MXC 把 Agent 行为切成 8 个拦截点（<code>agent_startup</code>、<code>input</code>、<code>pre_model_call</code>、<code>post_model_call</code>、<strong><code>pre_tool_call</code></strong>、<code>post_tool_call</code>、<code>output</code>、<code>agent_shutdown</code>），用 OPA/Rego 声明式策略做 allow / warn / deny / escalate 四档裁决，用可组合沙箱做强制隔离，并给 Agent 独立身份——它删了文件，日志里记的是 Agent，不是人。</p>
+<p>判断是对的：<strong>Agent 安全的未来在内核，不在提示词里</strong>。但它只解决了一半——管住了「谁能做什么」，没管住「模型看到的东西可不可信」。</p>
+
+<div class="note idea">
+  <span class="tag">三条路线各对了一部分</span>
+  <p>A 对了「需要一层 AI 运行时」，B 对了「交互必须重做」，C 对了「执行权必须下沉内核」。缺的那块是：<strong>信任必须是数据的属性，并随数据在系统内流动</strong>。这决定了整个架构的形状。</p>
+</div>
+
+<h3>一个改变判断的新事实</h3>
+<p>2026 年 7 月，OSWorld（真实计算机环境下的开放式任务基准）上的最好成绩达到 <strong>90.2%</strong>，而人类基线是 72.36%。两年前 GPT-4o 只有 12.2%。</p>
+<p>这个数字的含义比它看起来更重要：<strong>「AI 能不能用电脑」这个问题已经基本解决了。</strong>那为什么我们还没有 AI 操作系统？因为真正的瓶颈换成了三个——贵、慢、不敢信。OSWorld-Human 的效率研究给出了佐证：成功率最高的 agent 在最严格的效率指标上只有 17.4%，也就是说它做对了，但绕了三四倍的远路、花了三四倍的时间。</p>
+<p>所以这份文档的目标不是「让 AI 更强」，而是<strong>把已经足够强的能力，变成足够便宜、足够快、足够可信的系统行为</strong>。这是操作系统该干的活。</p>
+</section>
+
+<section id="s2">
+<h2><span class="num">02</span>硬件现实：真正的约束是带宽，不是算力<span class="badge">v2 新增</span></h2>
+
+<p>v1 在这里犯了个错：说「NPU 的 TOPS 有限」。这是把 PC 时代的算力思维直接搬过来了。实际情况是——</p>
+
+<div class="note danger">
+  <span class="tag">被普遍误解的一点</span>
+  <p>端侧大模型推理是<strong>内存带宽受限</strong>（memory-bandwidth-bound），不是算力受限。生成每一个 token，都要把参与计算的权重从内存搬到计算单元一次。70B 模型 4bit 量化约 35 GB，手机内存带宽按 60 GB/s 算，理论上限就是 1.7 token/s——再怎么堆 TOPS 也没用。一台 40 TOPS 的 AI PC 跑不动 70B，不是因为算力不够，是因为要把 35 GB 搬一遍。</p>
+</div>
+
+<p>这个修正带来的不是措辞调整，是四个设计结论。</p>
+
+<h3>结论一：调度目标从「省算力」变成「省搬运」</h3>
+<p>既然瓶颈是带宽，推理调度器的核心指标就不该是利用率，而是<strong>每生成一个有用 token 需要搬运多少字节</strong>。这直接引出三个策略：</p>
+<ul>
+<li><strong>驻留感知路由。</strong>切换模型意味着重新加载权重，代价是几百毫秒到几秒。如果系统同时轮换使用五个模型，带宽会全部消耗在加载权重上——这叫<strong>模型抖动</strong>（model thrashing），和内存页抖动是同一个病。对策是硬性约束：<strong>同时驻留的模型不超过两个</strong>（一个 1–3B 常驻小模型 + 一个按需大模型），路由时优先选择已驻留的模型，即使它的能力略差。</li>
+<li><strong>前缀复用。</strong>多个 agent 常共享同一段系统提示、同一份文档、同一段对话历史。相同前缀只算一次 prefill，KV 直接复用。这在服务端已是成熟做法（PagedAttention、RadixAttention），但<strong>跨应用、跨 agent 的复用只有操作系统能做</strong>。</li>
+<li><strong>动态精度。</strong>同一个模型保留 4bit 与 8bit 两份，难的推理走 8bit，日常走 4bit。精度从「模型属性」变成「调度变量」。</li>
+</ul>
+
+<h3>结论二：推理不可抢占，所以必须准入控制</h3>
+<p>绝大多数 NPU 不支持在一次推理中途换出。这意味着推理调度本质上是<strong>非抢占</strong>的，和 CPU 的抢占式调度完全不是一回事。一个已经跑了三秒的生成任务，没法为了响应用户的即时请求而中途让路。</p>
+<p>可行的做法只有三个：<strong>准入控制</strong>（估算这个请求要多久，超过交互预算就排队或降级到小模型）、<strong>分块解码 + 协作式让出</strong>（每生成 N 个 token 检查一次是否有更高优先级的请求，在块边界让出）、<strong>预留实时通道</strong>（给交互请求保留固定的时间片，后台任务只能填剩余）。</p>
+
+<h3>结论三：内存预算决定模型档位</h3>
+<p>8 GB 内存的手机撑不起稳定的端侧 AI 体验——权重、KV cache、中间激活三者叠加就超了。系统必须有一个显式的<strong>模型预算</strong>概念：根据可用内存与带宽，判定当前设备能跑哪一档模型，并据此决定路由策略。低端设备不是「体验差一点」，而是<strong>根本不该走多步规划</strong>，应该直接走确定性宏和单步工具调用。</p>
+
+<h3>结论四：长上下文时代，KV cache 比权重更贵</h3>
+<p>上下文拉到几万 token 时，KV cache 的占用会超过模型权重本身。所以<strong>上下文调度在物理上就是内存调度</strong>——这两个子系统必须是同一个，不能分给两个人做。</p>
+
+<table>
+<thead><tr><th>v1 的错误假设</th><th>修正后</th><th>架构影响</th></tr></thead>
+<tbody>
+<tr><td>NPU 算力是瓶颈</td><td>内存带宽是瓶颈</td><td>调度目标改为最小化字节搬运</td></tr>
+<tr><td>推理可以像线程一样抢占</td><td>不可抢占，只能块边界让出</td><td>必须做准入控制，不能靠抢占兜底</td></tr>
+<tr><td>模型越多越好，路由挑最强</td><td>模型切换有重载代价</td><td>驻留感知路由，限制并发驻留数</td></tr>
+<tr><td>上下文管理与内存管理可分开</td><td>KV cache 是最大内存消费者</td><td>两者必须合并为一个子系统</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="s3">
+<h2><span class="num">03</span>四种同时变稀缺的资源</h2>
+
+<p>操作系统的每次演进，都源于出现了一种新的稀缺资源，然后系统围绕它重建抽象：CPU 时间催生进程，内存催生虚拟地址空间，磁盘催生文件系统，网络催生 socket，电量催生移动端生命周期管理。</p>
+<p>这一次不是一种资源变稀缺，是四种同时变稀缺，而且互相冲突。</p>
+
+<div class="grid2">
+  <div class="mini"><div class="n">R1</div><h4>内存带宽</h4><p>不是算力。生成 token 的每一步都要搬权重，搬不动就是慢，堆核无效。</p></div>
+  <div class="mini"><div class="n">R2</div><h4>上下文窗口</h4><p>新的「内存」，但它是<strong>会遗忘的内存</strong>：容量有限、访问有损、写错会一直错。</p></div>
+  <div class="mini"><div class="n">R3</div><h4>可信上下文</h4><p>稀缺的不是信息，是<strong>能证明来源的信息</strong>。混进一段网页文本，整条决策链就被污染。</p></div>
+  <div class="mini"><div class="n">R4</div><h4>人的注意力</h4><p>Agent 越多，请求确认越多。人成了系统里吞吐最低、最容易饱和的组件。</p></div>
+</div>
+
+<p>R4 值得单独说。传统操作系统从没把「什么时候可以打断人」当成需要调度的资源——中断来自硬件，数量可控。但 AI 系统里每个后台 agent 都「有话要说」，都想请求确认、汇报进度、报告异常。不加调度，用户会在半小时内被淹没，然后学会全部点「同意」，安全机制就此失效。<strong>把注意力当资源调度，是这套设计里最反直觉、也最不可省的一块。</strong></p>
+</section>
+
+<section id="s4">
+<h2><span class="num">04</span>核心命题：确定化<span class="badge">v2 新增</span></h2>
+
+<p class="note prop" style="background:var(--violet-soft);border-color:#cdc9f2;font-size:15.5px;line-height:1.8">
+<span class="tag" style="color:var(--violet)">命题</span>
+操作系统的历史，就是不断把「慢的、不确定的、需要解释的」变成「快的、确定的、不需要解释的」。缓存把磁盘变成内存，JIT 把解释变成机器码，分支预测把流水线停顿变成无停顿。AI 原生操作系统要做的对应物是：<strong>把重复的意图编译成确定性的宏。</strong>
+</p>
+
+<h3>为什么这是唯一的长期出路</h3>
+<p>回到第 1 章那三个瓶颈：贵、慢、不敢信。如果每次都完整地走一遍「理解意图 → 规划 → 执行 → 验证」，这三个数字都不会随时间改善——模型换代能改善一点，但改善的是常数，不是斜率。</p>
+<p>而如果同一类意图在第二次、第五次、第二十次执行时越来越便宜，那就是<strong>结构性改善</strong>。这是操作系统最擅长的事：把重复的工作固化成机制。</p>
+
+<h3>三级确定化</h3>
+<table>
+<thead><tr><th>级别</th><th>机制</th><th>触发条件</th><th>效果</th><th>风险</th></tr></thead>
+<tbody>
+<tr><td>L1 计划缓存</td><td>复用计划 IR，跳过规划阶段，工具照常执行</td><td>结构指纹命中</td><td>省约 70% token，延迟降 30%</td><td>低：参数仍逐次校验</td></tr>
+<tr><td>L2 宏</td><td>计划编译成带槽位的确定性脚本，参数由轻量解析器填充</td><td>成功执行 ≥ 5 次且用户确认</td><td>零 LLM 调用，约 80 ms</td><td>中：需前置条件检查兜底</td></tr>
+<tr><td>L3 触发器</td><td>条件满足即自动执行，无人参与</td><td>用户显式授权 + 宏稳定运行 ≥ 20 次</td><td>约 0 成本，亚秒级</td><td>高：需「授权预算」上限</td></tr>
+</tbody>
+</table>
+
+<h3>宏必须可失效，否则会僵化</h3>
+<p>确定化最大的风险是：世界变了，宏还在跑。所以每个宏都必须携带<strong>前置条件</strong>和<strong>失效检测</strong>：</p>
+<ul>
+<li>前置条件：执行前必须验证的世界状态（如「日历该时段仍为空」）。不满足则<strong>回退到 L0 概率路径</strong>，重新规划。</li>
+<li>失效检测：连续 N 次因前置条件失败而回退，宏自动降级并进入重编译队列。</li>
+<li>版本绑定：宏绑定工具 schema 的版本。工具接口变了，宏自动失效——这是防止「工具升级后宏静默做错事」的唯一办法。</li>
+</ul>
+
+<div class="note ok">
+  <span class="tag">反直觉的结论</span>
+  <p>一个成熟的 AI 操作系统，<strong>成功标志是它越来越不需要 AI</strong>。如果一年后用户 80% 的日常意图仍要靠大模型现场推理，那说明这个系统只学到了皮毛——它把 AI 做成了一个更贵的命令行，而不是一个操作系统。</p>
+</div>
+
+<h3>为什么只有操作系统能做</h3>
+<p>应用层做不了这件事，有三个原因：应用看不到跨应用的意图重复（你在邮件里归档发票、在文件管理器里归档发票，是同一个意图）；应用无法保证宏的前置条件检查不被绕过（那是内核的活）；应用之间无法共享宏库（每个应用都要从零学一遍）。</p>
+<p><strong>确定化本质上是系统级的资源策略，不是应用级的功能。</strong>这是这份设计里我认为最站得住的一条。</p>
+</section>
+
+<section id="s5">
+<h2><span class="num">05</span>六条设计公理</h2>
+
+<div class="axiom"><div class="idx">Ⅰ</div><div class="body">
+<h4>AI 提议，内核执行</h4>
+<p>大模型永不进入可信计算基。它可以读、想、说，但任何改变外部世界的动作，必须由内核在能力校验之后代为执行。</p>
+</div></div>
+
+<div class="axiom"><div class="idx">Ⅱ</div><div class="body">
+<h4>信任是数据的属性，不是进程的属性</h4>
+<p>一个 agent 进程里既有用户亲口说的指令，也有刚从网页抓来的段落。两者必须区别对待，且标签要<strong>随数据流动</strong>——污点追踪在 AI 时代的复活。</p>
+</div></div>
+
+<div class="axiom"><div class="idx">Ⅲ</div><div class="body">
+<h4>一切副作用必须可补偿</h4>
+<p>隔离挡不住已经发出去的邮件。撤销不是产品功能，是安全机制，必须和权限检查同级。</p>
+</div></div>
+
+<div class="axiom"><div class="idx">Ⅳ</div><div class="body">
+<h4>确定性外壳，概率性内核</h4>
+<p>理解、规划、生成往上推，允许不确定；鉴权、执行、记录、回滚往下压，必须确定。系统形状是沙漏，不是直筒。</p>
+</div></div>
+
+<div class="axiom"><div class="idx">Ⅴ</div><div class="body">
+<h4>降级是一等公民</h4>
+<p>模型不可用、断网、超预算、电量告急时，系统必须退回传统交互并保持可用。这是最好的架构检验器：如果离了模型开不了机，分层就是假的。</p>
+</div></div>
+
+<div class="axiom"><div class="idx">Ⅵ</div><div class="body">
+<h4>重复即应确定化</h4>
+<p>任何被重复执行的意图，都有义务被逐步固化为确定性路径。不确定性是成本，不是特性；能消掉的不确定性必须消掉。</p>
+</div></div>
+</section>
+
+<section id="s6">
+<h2><span class="num">06</span>总体架构</h2>
+
+<figure>
+<svg viewBox="0 0 680 452" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>Loom 六层架构与信任边界</title>
+<desc>自下而上为异构算力、微内核、AI 运行时、语义系统服务、确定化层、意图交互层；微内核与 AI 运行时之间是信任边界。</desc>
+<g font-family="-apple-system,Segoe UI,Microsoft YaHei,sans-serif">
+  <rect x="40" y="42" width="600" height="52" rx="9" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+  <text x="58" y="62" font-size="13.5" font-weight="500" fill="#042C53">意图交互层</text>
+  <text x="58" y="80" font-size="11.5" fill="#185FA5">意图栏 · 生成式界面 · 渐进披露</text>
+  <text x="622" y="68" font-size="11" text-anchor="end" fill="#185FA5">概率性</text>
+
+  <rect x="40" y="102" width="600" height="52" rx="9" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+  <text x="58" y="122" font-size="13.5" font-weight="500" fill="#26215C">确定化层</text>
+  <text x="58" y="140" font-size="11.5" fill="#534AB7">计划缓存 · 意图宏 · 触发器 · 失效检测</text>
+  <text x="622" y="128" font-size="11" text-anchor="end" fill="#534AB7">趋近确定性</text>
+
+  <rect x="40" y="162" width="600" height="52" rx="9" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+  <text x="58" y="182" font-size="13.5" font-weight="500" fill="#042C53">语义系统服务</text>
+  <text x="58" y="200" font-size="11.5" fill="#185FA5">语义对象 · 记忆 · 现实缓存 · 能力 · 账本</text>
+  <text x="622" y="188" font-size="11" text-anchor="end" fill="#185FA5">概率性</text>
+
+  <rect x="40" y="222" width="600" height="52" rx="9" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+  <text x="58" y="242" font-size="13.5" font-weight="500" fill="#042C53">AI 运行时</text>
+  <text x="58" y="260" font-size="11.5" fill="#185FA5">意图编译器 · 模型路由 · 上下文 · 投机 · 验证</text>
+  <text x="622" y="248" font-size="11" text-anchor="end" fill="#185FA5">概率性</text>
+
+  <line x1="40" y1="282" x2="640" y2="282" stroke="#B4B2A9" stroke-width="0.5" stroke-dasharray="5 4"/>
+  <text x="640" y="276" font-size="10.5" text-anchor="end" fill="#5F5E5A">信任边界 —— 模型不得越过</text>
+
+  <rect x="40" y="290" width="600" height="52" rx="9" fill="#D3D1C7" stroke="#444441" stroke-width="0.5"/>
+  <text x="58" y="310" font-size="13.5" font-weight="500" fill="#2C2C2A">微内核 · Ring 0</text>
+  <text x="58" y="328" font-size="11.5" fill="#444441">能力校验 · 负能力 · 地址隔离 · 调度 · 无模型</text>
+  <text x="622" y="316" font-size="11" text-anchor="end" fill="#2C2C2A">确定性</text>
+
+  <rect x="40" y="350" width="600" height="52" rx="9" fill="#F1EFE8" stroke="#888780" stroke-width="0.5"/>
+  <text x="58" y="370" font-size="13.5" font-weight="500" fill="#2C2C2A">异构算力</text>
+  <text x="58" y="388" font-size="11.5" fill="#5F5E5A">NPU · GPU · CPU · 安全区 · 端云链路</text>
+  <text x="622" y="376" font-size="11" text-anchor="end" fill="#5F5E5A">确定性</text>
+
+  <line x1="340" y1="102" x2="340" y2="94" stroke="#534AB7" stroke-width="0.5" stroke-dasharray="3 3"/>
+  <text x="348" y="440" font-size="11" fill="#5F5E5A">确定化层是唯一「自下而上生长」的一层：它由实际使用模式编译而成，不是预先设计的</text>
+</g>
+</svg>
+<figcaption><b>图 1</b>　v1 的五层之上多了「确定化层」。注意它是唯一由运行时数据生长出来的层——其余五层是设计出来的，它是长出来的。</figcaption>
+</figure>
+
+<h3>为什么 AI 运行时不能进内核</h3>
+<p>诱惑很大：上下文管理、推理调度看起来像内存管理和 CPU 调度。但代价不可接受：可信计算基从几万行涨到几百万行外加模型权重，形式化验证彻底失去可能，一次提示注入直达最高权限。</p>
+<p>正确做法：<strong>AI 运行时是特权但不被信任的用户态服务集</strong>。它通过正常的能力申请流程请求内核做事，和第三方 agent 待遇相同，只是能力集合更宽、优先级更高。即使被完全攻破，攻击者拿到的也只是它当时持有的那几张令牌。</p>
+
+<div class="note ok">
+  <span class="tag">可检验的判据</span>
+  <p>如果明天删掉所有模型文件，系统还能开机、还能打开文件、还能用传统方式完成大部分日常操作——架构是对的。如果开不了机，那它就不是操作系统，是一个包装成操作系统的应用。</p>
+</div>
+</section>
+
+<section id="s7">
+<h2><span class="num">07</span>意图编译器与效果类型系统<span class="badge">v2 新增</span></h2>
+
+<p>现在所有 agent 的工作方式都是「先做，做错了再修」。这在操作系统层面不可接受——因为有些错误一旦做出去就收不回来。</p>
+<p>本章提出一个替代方案：<strong>在产生任何副作用之前，用类型系统静态拒绝掉坏计划</strong>。这不是新想法（编译原理早就有），但把它用在 agent 计划上，据我所知还没有系统实现。</p>
+
+<h3>编译流水线</h3>
+<pre><span class="c">// 意图 → 可执行计划</span>
+自然语言
+  ↓ ① 解析
+意图签名  { action: 归档, object: 发票, range: 上个月, success: 报销单已生成 }
+  ↓ ② 检索
+候选计划（宏库 / 计划缓存 / 技能库）── 命中则跳到 ⑤
+  ↓ ③ 合成（LLM + schema 约束解码）
+计划 IR（结构化，非自然语言）
+  ↓ ④ <span class="k">类型检查</span>  ← 关键：零副作用阶段
+  ↓ ⑤ 成本与风险估算
+执行 / 澄清 / 拒绝</pre>
+
+<h3>效果类型：让「发两次」编译不过</h3>
+<p>给每个工具一个类型签名，其中副作用用<strong>线性箭头</strong> <code>⊸</code> 标注——意思是这个值只能被消费一次：</p>
+<pre><span class="c">// 普通读取：可重复</span>
+read_file   : Path → Text
+search_mail : Query → List&lt;Mail&gt;
+
+<span class="c">// 线性副作用：只能发生一次</span>
+send_mail   : Draft ⊸ Receipt
+transfer    : (Account, Money) ⊸ Receipt
+delete      : File ⊸ Unit
+
+<span class="c">// 计划本身带效果行</span>
+archive_invoices : Effect&lt;{read: File, send: Mail, write: Ledger}&gt; ⇒ Report</pre>
+<p>线性类型的价值立刻显现：<strong>「把同一封邮件发给同一个人两次」在类型层面就是非法的</strong>。这类重复副作用是 agent 最常见的灾难性错误之一（重试逻辑写错、循环没退出），而传统做法只能靠运行时去重。</p>
+
+<h3>能力可达性检查</h3>
+<p>计划需要的效果集合，必须是当前能力集合的子集。不是的话，<strong>在编译期就失败</strong>，而不是执行到第三步才发现没权限。</p>
+<pre>需要: {read: File, send: Mail, write: Ledger}
+持有: {read: File, write: Ledger}
+<span class="r">✗ 编译失败：缺少 send:Mail 能力</span>
+<span class="c">→ 提示用户授予，或提供不含发送的替代计划</span></pre>
+<p>这个检查的工程价值被低估了。现在 agent 最常见的失败模式是「做了 80%，卡在最后一步」，用户看到的是一个半成品状态。编译期检查把这类失败提前到了零成本阶段。</p>
+
+<h3>前置 / 后置条件</h3>
+<p>每个计划携带可执行的世界状态断言：</p>
+<ul>
+<li><code>pre: calendar.slot_free(t) ∧ mail.count(unread) &lt; 50</code></li>
+<li><code>post: report.exists() ∧ report.line_count &gt; 0</code></li>
+</ul>
+<p>前置条件在执行前校验，不满足则重新规划；后置条件在执行后校验，不满足则触发补偿。<strong>这是确定化宏能够安全存在的基础</strong>——宏之所以敢零模型执行，就是因为它带着这些断言。</p>
+
+<h3>顺带得到：风险分级</h3>
+<p>类型系统还能自动算出风险等级，不需要额外配置：</p>
+<table>
+<thead><tr><th>计划涉及的效果</th><th>风险</th><th>默认处置</th></tr></thead>
+<tbody>
+<tr><td>只有 <code>read</code></td><td>低</td><td>直接执行</td></tr>
+<tr><td><code>read</code> + <code>write</code>（本地）</td><td>中</td><td>执行后可撤销</td></tr>
+<tr><td>含 <code>send</code> / <code>publish</code>（对外）</td><td>高</td><td>执行前确认</td></tr>
+<tr><td>含 <code>transfer</code>（资金）</td><td>极高</td><td>确认 + 冷静期 + 二次验证</td></tr>
+</tbody>
+</table>
+<p>注意这里没有任何模型参与判断——风险等级是<strong>类型推导出来的</strong>，因此不可被提示注入篡改。这是一个很重要的性质。</p>
+</section>
+
+<section id="s8">
+<h2><span class="num">08</span>内核对象与系统调用</h2>
+
+<p>操作系统之所以是操作系统，在于它定义了一套别人绕不过去的抽象。Loom 在进程/线程/文件/描述符之外，引入五个新对象。</p>
+
+<table>
+<thead><tr><th>对象</th><th>是什么</th><th>传统对应</th><th>关键属性</th></tr></thead>
+<tbody>
+<tr><td>Intent 意图</td><td>带约束、预算、成功判据的目标</td><td>作业</td><td>可澄清、可放弃、有截止时间</td></tr>
+<tr><td>Agent 代理</td><td>为达成意图而存在的执行体</td><td>进程</td><td>独立地址空间、独立身份、能力集</td></tr>
+<tr><td>Capability 能力</td><td>不可伪造、可衰减、可委托、会过期的凭证</td><td>文件描述符</td><td>精确到「哪个对象、什么操作、多久、几次」</td></tr>
+<tr><td>Context Handle 上下文句柄</td><td>带信任标签的上下文视图</td><td>内存映射</td><td>可撤销、带污点、可引用计数</td></tr>
+<tr><td>Effect 效果</td><td>一次对外部世界的改变，事务化</td><td>系统调用</td><td>幂等键、补偿动作、可重放</td></tr>
+</tbody>
+</table>
+
+<h3>系统调用表</h3>
+<p>原语刻意保持在个位数——每多一个，安全审计复杂度就翻一倍。</p>
+
+<table>
+<thead><tr><th>原语</th><th>签名</th><th>对应</th><th>语义</th></tr></thead>
+<tbody>
+<tr><td>提交意图</td><td><code>intent_submit(goal, constraints, budget) → task</code></td><td>fork / exec</td><td>创建有目标、预算、策略的任务</td></tr>
+<tr><td>绑定上下文</td><td><code>ctx_attach(task, handle, trust)</code></td><td>mmap</td><td>把带信任级别的上下文映射进任务</td></tr>
+<tr><td>申请能力</td><td><code>cap_request(tool, scope, ttl) → cap</code></td><td>open</td><td>拿到会过期、可衰减的凭证</td></tr>
+<tr><td>执行动作</td><td><code>act(cap, args) → txn</code></td><td>write / ioctl</td><td>唯一能改变世界的入口，返回事务</td></tr>
+<tr><td>提交 / 回滚</td><td><code>txn_commit(txn)</code> / <code>txn_abort(txn)</code></td><td>fsync</td><td>事务化，失败自动补偿</td></tr>
+<tr><td>断言记忆</td><td><code>mem_assert(fact, provenance, ttl)</code></td><td>write</td><td>写入必须带出处，无出处不落库</td></tr>
+<tr><td>语义召回</td><td><code>mem_recall(query, scope) → items + conf</code></td><td>read</td><td>返回结果同时返回置信度</td></tr>
+<tr><td>订阅世界</td><td><code>watch(predicate) → event</code></td><td>epoll</td><td>事件驱动，避免 agent 轮询烧带宽</td></tr>
+<tr><td>请人决策</td><td><code>yield(reason, options) → decision</code></td><td>signal</td><td>请求裁决，必须带选项与默认值</td></tr>
+<tr><td>撤销</td><td><code>undo(txn_id)</code></td><td>—</td><td>新增原语，一等公民</td></tr>
+</tbody>
+</table>
+
+<p>注意 <code>mem_recall</code> 返回 <code>items + conf</code> 而不是纯结果。这个细节很关键：<strong>检索是概率的，系统必须知道「我可能没找到」</strong>。置信度低于阈值时，正确行为不是硬着头皮往下走，而是升级成一次 <code>yield</code>。</p>
+
+<h3>Agent 的控制组：cgroup 的对应物</h3>
+<p>每个 agent 属于一个 <strong>agent group</strong>，拥有五类配额，超出即被内核限流：</p>
+<ul>
+<li><strong>token 预算</strong>：本次任务最多消耗多少推理 token</li>
+<li><strong>搬运预算</strong>：最多多少字节的权重/KV 搬运（对应带宽这个真实瓶颈）</li>
+<li><strong>能力配额</strong>：最多同时持有多少张能力令牌</li>
+<li><strong>副作用配额</strong>：最多能发起多少次写/发送/转账</li>
+<li><strong>注意力配额</strong>：最多能打断用户几次（见第 14 章）</li>
+</ul>
+<p>最后一类是全新的，也是最容易被设计者忽略的——但它是唯一直接约束「系统有多烦人」的机制。</p>
+</section>
+
+<section id="s9">
+<h2><span class="num">09</span>五个调度器</h2>
+
+<table>
+<thead><tr><th>调度器</th><th>调度对象</th><th>优化目标</th><th>策略要点</th></tr></thead>
+<tbody>
+<tr><td>① 算力调度</td><td>线程、页、IO 队列</td><td>利用率与尾延迟</td><td>沿用成熟做法，为推理预留实时通道</td></tr>
+<tr><td>② 推理调度 <em>新</em></td><td>token、KV cache、<strong>字节搬运量</strong></td><td>首 token 延迟、每焦耳 token 数</td><td>驻留感知路由、前缀复用、准入控制、块边界让出</td></tr>
+<tr><td>③ 上下文调度 <em>新</em></td><td>上下文窗口（会遗忘的内存）</td><td>有效信息密度、语义缺页率</td><td>语义换页、摘要驱逐、按需重取</td></tr>
+<tr><td>④ 注意力调度 <em>新</em></td><td>人的打断次数与时机</td><td>「这次打断值得」的比例</td><td>拥塞控制、合并、分级、静默期</td></tr>
+<tr><td>⑤ 信任调度 <em>新</em></td><td>能力令牌</td><td>越权率、爆炸半径</td><td>最小权限、短租约、逐级升级、负能力</td></tr>
+</tbody>
+</table>
+
+<h3>② 推理调度：三个必须同时满足的约束</h3>
+<p>这是 v2 改动最大的一节。v1 把它当「CPU 调度 + NPU 队列」，错了。真实约束是三条同时成立的：</p>
+<ol>
+<li><strong>带宽受限</strong>：换模型 = 重载权重 = 几百毫秒到几秒。所以路由必须<strong>驻留感知</strong>：优先选已加载的模型，即使能力略差。</li>
+<li><strong>不可抢占</strong>：NPU 不支持中途换出。所以必须<strong>准入控制</strong>：估算耗时，超预算就排队或降级，不能靠抢占兜底。</li>
+<li><strong>前缀可复用</strong>：相同前缀只算一次 prefill。这在服务端已成熟（PagedAttention / RadixAttention），但<strong>跨应用复用只有 OS 能做</strong>。</li>
+</ol>
+<p>三条合起来的调度策略：<strong>限制同时驻留模型数 ≤ 2；交互请求走预留时间片；后台任务在块边界让出；前缀缓存按 LRU 跨 agent 共享。</strong></p>
+
+<h3>③ 上下文调度：语义缺页</h3>
+<p>上下文窗口是新的内存，但和真内存有个本质区别：<strong>缺页是概率的</strong>。真 MMU 缺页一定取得到；语义召回可能返回错的，也可能什么都返回不了。</p>
+<p>所以上下文调度器必须维护显式的「缺页置信度」并定义三级降级：置信度高 → 直接用；中等 → 补充检索或换表述重试；低 → 停下来问人。<strong>把「我不知道」变成可调度的事件，而不是让模型编一个答案。</strong></p>
+
+<h3>④ 注意力调度：见第 14 章</h3>
+<p>这一块单独成章，因为它值得一套完整的控制论设计。</p>
+
+<h3>⑤ 信任调度：把安全当配额</h3>
+<p>权限不是一道静态的门，而是<strong>随时间逐步发放、可随时收回的资源</strong>。agent 起步只拿「读这三个文件」，随任务推进和用户确认逐步升级，任务结束立刻失效。即使某环节被攻破，攻击者拿到的也是一张快要过期、范围极窄的票。</p>
+</section>
+
+<section id="s10">
+<h2><span class="num">10</span>上下文与记忆</h2>
+
+<p>记忆决定了系统是「每次从零开始」还是「越用越懂你」。它也是最危险的部分——记错的东西会一直错下去，而且越用越自信。</p>
+
+<table>
+<thead><tr><th>层</th><th>内容</th><th>介质</th><th>生命周期</th><th>写入规则</th></tr></thead>
+<tbody>
+<tr><td>L0 工作集</td><td>当前 prompt 与 KV cache</td><td>NPU 显存</td><td>秒级</td><td>自动，可随时丢弃</td></tr>
+<tr><td>L1 情节</td><td>最近交互、事件流、任务轨迹</td><td>本地向量库 + 事件日志</td><td>天到周</td><td>自动写入，带完整出处</td></tr>
+<tr><td>L2 语义 / 程序</td><td>提炼的事实、偏好、可复用技能</td><td>结构化库 + 小模型</td><td>月到永久</td><td><strong>需置信度阈值 + 用户可见</strong></td></tr>
+<tr><td>L3 冷存档</td><td>原始记录、加密备份</td><td>本地磁盘 / 用户自有云</td><td>永久</td><td>只追加，不可改</td></tr>
+</tbody>
+</table>
+
+<h3>三条不可妥协的规则</h3>
+<p><strong>无出处不落库。</strong>每条记忆必须带 provenance：何时、从哪来、谁说的、当时置信度。无出处的只能待在 L1，不能升级到 L2。</p>
+<p><strong>置信度随时间衰减。</strong>「用户喜欢靠窗座位」三年前成立不代表今天成立。记忆需要半衰期，过期自动降级，重要决策前重新确认。</p>
+<p><strong>记忆必须可审阅、可删除。</strong>用户应能像查征信报告一样看到系统记住了什么、依据是什么、用在了哪里。这既是隐私要求，也是纠错机制——模型自己不会发现记错了，只有人能看到。</p>
+
+<div class="note danger">
+  <span class="tag">记忆投毒：这是有实证的攻击</span>
+  <p>2026 年的研究（《Poison Once, Exploit Forever》）已经证明：恶意内容一旦进入 agent 记忆库，会在之后每次会话被反复「喂」给模型，形成<strong>永久驻留</strong>的攻击面。这不需要攻破任何加密，只需要让模型「读到」并「记住」。<strong>所以记忆写入必须是受控的系统调用，不能是 agent 随手一写。</strong></p>
+</div>
+
+<h3>工程上的四层防御</h3>
+<ol>
+<li><strong>写入白名单</strong>：只有经过验证的通道（用户直接输入、系统签名的事件）才能写 L2。来自网页、邮件、第三方 API 的内容只能写 L1，且带 <code>untrusted</code> 标签。</li>
+<li><strong>高风险记忆双通道验证</strong>：涉及权限、支付、身份的记忆，必须两个独立来源一致才能落库。</li>
+<li><strong>定期记忆体检</strong>：扫描无出处、孤立（没有任何引用它的推理链）、与已确认事实矛盾的条目，主动标记待审。</li>
+<li><strong>召回时按信任加权</strong>：同等相关度下，可信来源的记忆优先；untrusted 记忆在进入 prompt 时必须显式标注来源。</li>
+</ol>
+</section>
+
+<section id="s11">
+<h2><span class="num">11</span>现实缓存：给外部世界做缓存一致性<span class="badge">v2 新增</span></h2>
+
+<p>Agent 每一轮都要知道世界状态：日历那个时段空不空、这封邮件读没读、文件改没改。每次都去查 API，慢、有限流、还贵。</p>
+<p>但直接缓存又不行——世界会变。这就是一个经典的缓存一致性问题，只不过缓存的对象不是内存块，而是<strong>现实</strong>。</p>
+
+<h3>四种状态</h3>
+<p>借 MESI 协议的结构，但语义要改：</p>
+
+<table>
+<thead><tr><th>状态</th><th>含义</th><th>可以读吗</th><th>离开条件</th></tr></thead>
+<tbody>
+<tr><td><strong>E</strong> 独占最新</td><td>刚取回，且确认没有并发修改</td><td>可以，无需校验</td><td>本地写 → M；收到外部变更 → I</td></tr>
+<tr><td><strong>M</strong> 已修改待确认</td><td>我们本地改了，尚未收到服务端回执</td><td>可以（read-your-writes）</td><td>收到回执 → E；冲突 → I</td></tr>
+<tr><td><strong>S</strong> 共享可能过期</td><td>曾经正确，但可能有别人改过</td><td>可以，但高风险操作前需 revalidate</td><td>revalidate 成功 → E</td></tr>
+<tr><td><strong>I</strong> 失效</td><td>已知过期</td><td>不可以，必须重取</td><td>重取 → E</td></tr>
+</tbody>
+</table>
+
+<h3>一致性等级由工具声明，不由调用方决定</h3>
+<p>这是这个设计的核心。不同工具对新鲜度的要求差了几个数量级，统一处理要么太慢要么太危险：</p>
+
+<table>
+<thead><tr><th>工具类别</th><th>一致性等级</th><th>行为</th></tr></thead>
+<tbody>
+<tr><td>支付、转账、余额</td><td><strong>强一致</strong></td><td>每次重读，禁止使用缓存</td></tr>
+<tr><td>日历、任务、文件</td><td><strong>因果一致</strong></td><td>保证 read-your-writes，写后读必见自己的写</td></tr>
+<tr><td>天气、新闻、股价</td><td><strong>最终一致</strong></td><td>TTL 10 分钟，过期重取</td></tr>
+<tr><td>设备状态（电量、位置）</td><td><strong>尽力而为</strong></td><td>本地传感器直读，不进缓存</td></tr>
+</tbody>
+</table>
+
+<p>把一致性等级写进工具清单，意味着<strong>应用无法为了性能偷偷降低一致性</strong>——这是操作系统该守的底线。</p>
+
+<h3>失效的三个来源，按优先级</h3>
+<ol>
+<li><strong>推送</strong>（最好）：服务端支持变更通知时，实时失效。成本最低、准确度最高。</li>
+<li><strong>TTL</strong>（次好）：按工具声明的时长过期。</li>
+<li><strong>用前校验</strong>（兜底）：高风险操作前强制 revalidate，即使缓存看起来是 E 状态。</li>
+</ol>
+
+<h3>冲突处理</h3>
+<p>M 状态下收到外部变更，就是冲突。此时<strong>不允许自动合并</strong>——现实世界的冲突（两个人都改了同一场会议时间）往往需要人的判断。系统应触发 <code>yield</code>，把两个版本并列呈现，让人选。</p>
+
+<div class="note idea">
+  <span class="tag">为什么这个抽象值得做</span>
+  <p>没有它，每个 agent 都要自己实现一套「查—缓存—失效—冲突」逻辑，而且互相不一致。有了它，<strong>「世界现在是什么样」变成一个系统服务</strong>，agent 只需要声明自己要什么级别的新鲜度。这是把一件每个应用都做错的事，变成一件系统做对一次的事——操作系统的经典价值。</p>
+</div>
+</section>
+
+<section id="s12">
+<h2><span class="num">12</span>投机执行与提交验证<span class="badge">v2 新增</span></h2>
+
+<p>Agent 的主要延迟不在模型解码，而在<strong>等工具返回</strong>。一次编译、一次 API 调用、一次文件扫描，动辄几十秒。而这段时间里模型是空闲的。</p>
+<p>2026 年的研究（TomasuLLM）已经把这个想法工程化了：把 CPU 的乱序执行搬到 agent 工具调用上，投机预测下一步动作并提前在沙箱里执行，命中时提速 1.27–1.35 倍。</p>
+<p>它的三个关键机制值得直接采纳：</p>
+<ul>
+<li><strong>乱序发射、顺序提交</strong>：可以提前做，但只有验证通过的结果才对主 agent 可见。</li>
+<li><strong>预测 ≠ 证据</strong>：预测出的 observation 只能让下游推理继续跑，绝不能当作事实提交。</li>
+<li><strong>四个验证谓词</strong>：动作一致 <code>V_act</code> ∧ 依赖新鲜 <code>V_dep</code> ∧ 观察完整 <code>V_record</code> ∧ 副作用安全 <code>V_effect</code>。</li>
+</ul>
+
+<h3>操作系统该补的三件事</h3>
+<p>但论文自己也承认了代价：<strong>每省 1 秒实际耗时，要花 2.1 秒投机算力</strong>。在插电的服务器上这是划算的，在靠电池的手机上是灾难。这恰恰是操作系统必须介入的地方。</p>
+
+<h4>一、投机预算：把投机当可关闭的调度策略</h4>
+<p>投机消耗真实的算力和电量，必须计入 agent 的 cgroup。开关条件应该是系统级的：</p>
+<ul>
+<li>电量 &lt; 20% 或温度接近阈值 → 关闭投机</li>
+<li>用户正在等待（前台交互）→ 开启，因为省的是人的时间</li>
+<li>后台批处理 → 关闭，因为没人等，省算力更重要</li>
+<li>工具耗时占比 f &lt; 40% → 关闭，因为理论上限 1/(1−f) 太低，回不了本</li>
+</ul>
+<p>最后一条是硬门槛。投机只在高延迟工具上划算，在亚秒级调用上纯亏。</p>
+
+<h4>二、语义投机：OS 才有的全局视野</h4>
+<p>论文的投机停留在「预测下一个工具调用」。操作系统能看到更多：</p>
+<ul>
+<li><strong>预取上下文</strong>：用户说「下周去上海出差」，OS 可以提前把常旅客信息、上次行程、公司差旅政策载入 L1——即使 agent 还没请求。</li>
+<li><strong>预驻留模型</strong>：预测到接下来需要长上下文推理，提前把大模型加载进内存，避免首次调用的几百毫秒重载。</li>
+<li><strong>预热工具</strong>：预测要用到日历，提前建立连接、拉取本周事件到现实缓存。</li>
+</ul>
+<p>这些都不改变 agent 的行为，只是让它的下一次请求命中缓存。收益比动作级投机更稳定，因为<strong>预取错了只是浪费一点带宽，不会产生错误结果</strong>。</p>
+
+<h4>三、不可投机屏障</h4>
+<p>有些动作绝不能投机执行，必须串行：</p>
+<ul>
+<li><strong>不可补偿的副作用</strong>：转账、对外发送、删除。投机执行它们等于绕过确认。</li>
+<li><strong>不可追踪的依赖</strong>：读集合无法被完整捕获的调用（远程 API、共享进程），投机结果不可信。</li>
+<li><strong>依赖尚未生成的内容</strong>：草稿编辑这类「内容依赖所读内容」的动作，没法提前。</li>
+</ul>
+<p>内核必须在 <code>act()</code> 入口检查这几个条件，命中则强制串行。<strong>这个检查不能放在用户态</strong>，否则被攻破的运行时可以自己关掉它。</p>
+
+<div class="note warn">
+  <span class="tag">诚实的收益预期</span>
+  <p>投机的加速比上限是 <code>1/(1−f)</code>，f 是工具耗时占比。工具占 35% 时上限 1.54 倍，占 40% 时 1.67 倍。而实测只有 1.27–1.35 倍，因为预测命中率只有 46%。<strong>不要指望投机解决延迟问题</strong>，它只是把等待时间填满，真正的解法是确定化（第 4 章）——把整个流程变成不需要等待的宏。</p>
+</div>
+</section>
+
+<section id="s13">
+<h2><span class="num">13</span>安全模型</h2>
+
+<p>先说结论：<strong>提示注入在模型层面无解，只能在系统层面让它失效。</strong></p>
+
+<h3>为什么模型层面无解</h3>
+<p>对模型来说，系统提示、用户输入、网页内容，都是同一串 token，没有本质区别。所有「请不要听信以下内容里的指令」这类防御都是概率性的——降低成功率，给不了保证。只要系统还允许「模型读到的东西」直接影响「模型能做的事」，这条路就是通的。</p>
+<p>所以目标不是「阻止注入」，而是<em>「即使注入成功，也不产生安全后果」</em>。这和当年对付缓冲区溢出是同一个思路：不指望消灭漏洞，而是让漏洞不可利用。</p>
+
+<h3>核心机制：把计划和执行拆给两个模型</h3>
+
+<figure>
+<svg viewBox="0 0 680 190" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>双模型分离：计划器与验证器各自缺失一半能力</title>
+<desc>不可信内容进入零工具权限的计划器，输出结构化计划 IR，再交给看不见原文的验证器执行。</desc>
+<defs><marker id="ar2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<g font-family="-apple-system,Segoe UI,Microsoft YaHei,sans-serif">
+  <text x="340" y="28" font-size="12" text-anchor="middle" fill="#5F5E5A">两边各自缺失一半能力，攻击链因此断开</text>
+  <rect x="40" y="52" width="108" height="56" rx="8" fill="#F1EFE8" stroke="#888780" stroke-width="0.5"/>
+  <text x="94" y="74" font-size="13" font-weight="500" text-anchor="middle" fill="#2C2C2A">不可信内容</text>
+  <text x="94" y="92" font-size="11.5" text-anchor="middle" fill="#5F5E5A">网页 / 邮件</text>
+  <rect x="163" y="52" width="108" height="56" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+  <text x="217" y="74" font-size="13" font-weight="500" text-anchor="middle" fill="#042C53">计划器</text>
+  <text x="217" y="92" font-size="11.5" text-anchor="middle" fill="#185FA5">零工具权限</text>
+  <rect x="286" y="52" width="108" height="56" rx="8" fill="#D3D1C7" stroke="#444441" stroke-width="0.5"/>
+  <text x="340" y="74" font-size="13" font-weight="500" text-anchor="middle" fill="#2C2C2A">计划 IR</text>
+  <text x="340" y="92" font-size="11.5" text-anchor="middle" fill="#444441">类型检查气闸</text>
+  <rect x="409" y="52" width="108" height="56" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+  <text x="463" y="74" font-size="13" font-weight="500" text-anchor="middle" fill="#042C53">验证器</text>
+  <text x="463" y="92" font-size="11.5" text-anchor="middle" fill="#185FA5">不见原文</text>
+  <rect x="532" y="52" width="108" height="56" rx="8" fill="#F1EFE8" stroke="#888780" stroke-width="0.5"/>
+  <text x="586" y="74" font-size="13" font-weight="500" text-anchor="middle" fill="#2C2C2A">执行</text>
+  <text x="586" y="92" font-size="11.5" text-anchor="middle" fill="#5F5E5A">能力校验后</text>
+  <line x1="150" y1="80" x2="161" y2="80" stroke="#888780" stroke-width="1.5" marker-end="url(#ar2)"/>
+  <line x1="273" y1="80" x2="284" y2="80" stroke="#888780" stroke-width="1.5" marker-end="url(#ar2)"/>
+  <line x1="396" y1="80" x2="407" y2="80" stroke="#888780" stroke-width="1.5" marker-end="url(#ar2)"/>
+  <line x1="519" y1="80" x2="530" y2="80" stroke="#888780" stroke-width="1.5" marker-end="url(#ar2)"/>
+  <text x="217" y="134" font-size="11.5" text-anchor="middle" fill="#A32D2D">看得见脏数据</text>
+  <text x="217" y="150" font-size="11.5" text-anchor="middle" fill="#A32D2D">碰不到任何工具</text>
+  <text x="463" y="134" font-size="11.5" text-anchor="middle" fill="#A32D2D">握着工具</text>
+  <text x="463" y="150" font-size="11.5" text-anchor="middle" fill="#A32D2D">看不见原文</text>
+</g>
+</svg>
+<figcaption><b>图 2</b>　气闸必须是结构化 IR，不能是自然语言摘要。v2 补充：这道气闸现在由第 7 章的类型检查器把守，坏计划在这里就编译不过。</figcaption>
+</figure>
+
+<h3>上下文污点追踪</h3>
+<p>每段进入上下文的文本带一个信任标签：<code>user</code>（用户亲口说的）、<code>verified</code>（系统签名验证过的）、<code>untrusted</code>（外部抓取的）。污点沿推理链传播——用 untrusted 内容得出的结论仍是 untrusted。规则：</p>
+<ul>
+<li>带 <code>untrusted</code> 污点的计划，不能直接触发高风险动作，必须经过 <code>yield</code>。</li>
+<li>污点不会因为「被摘要过」而消失——摘要继承来源的最高污点。</li>
+<li>只有用户明确确认，或经独立可信通道验证，污点才能清除。</li>
+</ul>
+<p>这是操作系统信息流控制（IFC）的老理论，只是把「文件密级」换成了「上下文可信度」。目前还没有主流系统在 AI 场景真正实现它。</p>
+
+<h3>负能力：单调的拒绝<span class="badge">v2 新增</span></h3>
+<p>传统能力系统只有「允许」。但允许是可以被绕过的——通过委托链：A 有读权限，A 把缩小后的权限委托给 B，B 再委托给 C，最后 C 拿到的东西可能超出了任何人的本意。</p>
+<p>所以需要<strong>负能力</strong>：一旦某个能力被标记为禁止，任何从它派生的能力也禁止，且不能被「衰减掉」。</p>
+<pre>形式化：cap' ⊑ cap  ⇒  deny(cap) ⇒ deny(cap')
+含义：拒绝沿委托链向下单调传播，只会变多，不会变少</pre>
+<p>典型用途：企业策略「任何 agent 不得访问财务目录」。即使某个 agent 通过委托链拿到了财务目录的读能力，负能力仍然生效。<strong>这是防止「合法授权拼出不合法权限」的唯一结构性手段。</strong></p>
+
+<h3>工具供应链：清单就是代码<span class="badge">v2 新增</span></h3>
+<p>MCP 生态在 2026 年暴露了一整类新攻击面，值得单独对待：</p>
+<ul>
+<li><strong>工具投毒</strong>：工具的自然语言描述里藏指令。因为描述会进入上下文，模型会把「描述」当成「指令」。</li>
+<li><strong>Rug Pull</strong>：工具通过审核后偷偷改描述或行为（CVE-2026-59822 一类）。</li>
+<li><strong>Confused Deputy</strong>：工具借调用者的权限做调用者无权做的事。</li>
+</ul>
+<p>三条对策，全部在系统层实现：</p>
+<ol>
+<li><strong>描述哈希固定</strong>：工具描述在首次批准时算哈希并钉住，之后任何变更都使授权失效，需要重新批准。</li>
+<li><strong>描述是数据，不是指令</strong>：工具描述进入上下文时必须带 <code>untrusted</code> 标签，并做聚光处理（定界符 / 数据标记）。</li>
+<li><strong>能力显式传递</strong>：工具代调用时，必须显式传入一张能力令牌，不能「借用调用者的权限」。</li>
+</ol>
+
+<h3>权限模型：能力，而不是身份</h3>
+<ul>
+<li><strong>不可伪造</strong>：令牌由内核签发，用户态无法构造。</li>
+<li><strong>可衰减</strong>：可以缩小后转授（只读、单文件、十分钟），不能放大。</li>
+<li><strong>短租约</strong>：默认 10 分钟过期，长期任务需续租，续租时重新评估风险。</li>
+<li><strong>可撤销</strong>：一键收回，进行中的动作立即中止并触发补偿。</li>
+<li><strong>可归因</strong>：每次使用记录在行动账本上，能回答「这个文件是谁在何时为何读的」。</li>
+</ul>
+</section>
+
+<section id="s14">
+<h2><span class="num">14</span>注意力拥塞控制<span class="badge">v2 新增</span></h2>
+
+<p>这是我认为最被低估的一块，也是唯一能直接决定「用户会不会关掉这个系统」的机制。</p>
+
+<h3>把打断看成丢包</h3>
+<p>网络拥塞控制的本质是：发送方不知道链路容量，只能通过「丢包」这个信号推断，然后调整速率。用户注意力是完全一样的结构——<strong>系统不知道用户现在忙不忙，只能通过「忽略 / 拒绝」这个信号推断</strong>。</p>
+<p>所以直接借 TCP 的 AIMD：</p>
+<ul>
+<li><strong>加性增</strong>（Additive Increase）：用户持续响应时，允许的打断频率线性增加。</li>
+<li><strong>乘性减</strong>（Multiplicative Decrease）：被拒绝或忽略时，频率折半。</li>
+<li><strong>慢启动</strong>：新 agent 从很低配额起步，表现好才加速。这防止一个新装的 agent 立刻开始轰炸。</li>
+<li><strong>RTT 类比</strong>：从请求到用户响应的延迟。响应很慢说明用户在忙，应主动降速——不必等到被拒绝。</li>
+</ul>
+
+<h3>公平性：max-min</h3>
+<p>多个 agent 竞争同一个人的注意力，用 max-min 公平分配：先保证每个 agent 拿到最低配额，剩余额度再按需求分配。这样不会出现「一个话多的 agent 饿死其他所有 agent」。</p>
+
+<h3>中断定价</h3>
+<p>更激进一点：给每次打断标价，agent 必须从自己的注意力配额里「付钱」。这会自然产生正确的行为：</p>
+<ul>
+<li>agent 会主动合并多个确认请求（省钱）。</li>
+<li>agent 会倾向于选择「默认安全动作 + 事后告知」而不是「事前询问」（更省钱）。</li>
+<li>只有真正重要的事才值得花配额——<strong>这个判断由 agent 自己做，而不是由用户配置</strong>。</li>
+</ul>
+
+<h3>分级：什么才配立即打断</h3>
+<table>
+<thead><tr><th>级别</th><th>条件</th><th>行为</th></tr></thead>
+<tbody>
+<tr><td>P0 立即</td><td>不可逆 + 高风险（转账、对外发送、删除）</td><td>立即打断，可覆盖静默期</td></tr>
+<tr><td>P1 尽快</td><td>可逆但影响较大（批量修改）</td><td>进入队列，在用户自然停顿点呈现</td></tr>
+<tr><td>P2 汇总</td><td>进度汇报、低风险确认</td><td>合并成一次日报式摘要</td></tr>
+<tr><td>P3 静默</td><td>纯信息</td><td>只写账本，不打扰</td></tr>
+</tbody>
+</table>
+
+<div class="note ok">
+  <span class="tag">为什么值得做成控制回路</span>
+  <p>如果注意力配额是静态配置，用户要么配得太松被淹没，要么配得太紧错过重要确认。<strong>做成自适应回路之后，系统会自己学会什么时候该闭嘴</strong>——而这恰恰是所有人对 AI 助手最朴素的期待。</p>
+</div>
+</section>
+
+<section id="s15">
+<h2><span class="num">15</span>动作与事务</h2>
+
+<p>隔离挡不住已经发出去的邮件。这是 AI 系统和传统系统的根本差异：它的错误会<strong>离开计算机</strong>。</p>
+
+<p>所以每个 <code>act()</code> 都必须在事务里执行，附带三类元数据：</p>
+<ul>
+<li><strong>幂等键</strong>：重试不会重复下单。在网络不稳、agent 反复重试时是救命的。</li>
+<li><strong>补偿动作</strong>：后续步骤失败时怎么撤回这一步。发邮件没有真正的补偿，那就必须在发送前设更高的确认门槛——<em>不可补偿的动作，必须用更严的前置约束来换</em>。</li>
+<li><strong>前置条件</strong>：执行前世界必须处于什么状态。不满足则整个事务不启动，而不是做到一半才发现。</li>
+</ul>
+
+<h3>三档可补偿性</h3>
+<table>
+<thead><tr><th>档位</th><th>例子</th><th>策略</th></tr></thead>
+<tbody>
+<tr><td>可完全补偿</td><td>本地文件操作、草稿</td><td>允许后台 agent 自主执行，随时可撤</td></tr>
+<tr><td>可部分补偿</td><td>撤销 API 存在但有时间窗（发送后 30 秒内可撤回）</td><td>必须走确认，且提示时间窗</td></tr>
+<tr><td>不可补偿</td><td>对外通信、支付、物理动作</td><td>禁止后台自主执行，必须前台确认 + 冷静期</td></tr>
+</tbody>
+</table>
+
+<h3>冷静期：给不可逆动作加一个倒计时</h3>
+<p>借鉴银行转账的延迟到账。对不可补偿动作，系统不立即提交，而是进入 <strong>pending</strong> 状态，显示倒计时（比如 10 秒），期间可一键取消。这不是技术限制，是<strong>利用人的后悔反射</strong>——大部分误操作在几秒内就会被自己发现。</p>
+
+<h3>可重放：给概率系统装调试器</h3>
+<p>传统系统出问题，复现一遍就行。AI 系统不行——同样的输入，模型可能给出不同结果。所以系统层记录「决策轨迹」：每个决策点的输入摘要、模型版本与参数、输出、工具返回、当时的能力集合。有了它才能时间旅行调试：回到第 7 步，看当时模型看到了什么、为什么选了那个工具。</p>
+<p>这份轨迹同时是合规审计、责任归属、模型迭代回归测试的基础设施。没有它，系统在真实环境里无法运维。</p>
+</section>
+
+<section id="s16">
+<h2><span class="num">16</span>失败分类学：Agent 的异常向量表<span class="badge">v2 新增</span></h2>
+
+<p>CPU 有异常向量表：缺页、除零、非法指令，每一类都有确定的处理程序。Agent 也需要一张。区别是 agent 的失败模式不是硬件定义的，得自己总结。</p>
+
+<table>
+<thead><tr><th>类别</th><th>症状</th><th>检测方式</th><th>OS 处理</th><th>CPU 类比</th></tr></thead>
+<tbody>
+<tr><td>无据断言</td><td>说了没有出处的话</td><td>验证器要求引用，无引用即拒</td><td>拒绝输出，重试或标注不确定</td><td>—</td></tr>
+<tr><td>无进展循环</td><td>重复同一动作</td><td>状态指纹去重 + 看门狗</td><td>中止，换策略，或升级给人</td><td>死锁检测</td></tr>
+<tr><td>越权</td><td>请求未持有的能力</td><td>内核能力校验</td><td>确定性拒绝 + 记账</td><td>保护异常</td></tr>
+<tr><td>注入污染</td><td>计划含外部指令</td><td>污点追踪 + 类型检查</td><td>降级为需确认</td><td>—</td></tr>
+<tr><td>资源耗尽</td><td>token / 内存 / 时间超限</td><td>agent cgroup</td><td>抢占 + 检查点 + 降级</td><td>OOM killer</td></tr>
+<tr><td>世界已变</td><td>前置条件失效</td><td>事务前置检查</td><td>回滚 + 重新规划</td><td>乐观并发失败</td></tr>
+<tr><td>意图漂移</td><td>用户中途改主意</td><td>意图版本 diff</td><td>重新规划，保留已完成部分</td><td>信号</td></tr>
+</tbody>
+</table>
+
+<h3>「无进展」怎么检测</h3>
+<p>这是最难的一类，也是最容易被用户感知的——agent 转了十分钟，什么也没做成。检测思路是维护一个<strong>任务状态指纹</strong>：把当前计划进度、已确认的事实、已完成的副作用做成哈希。如果连续 N 轮指纹不变，判定为无进展。</p>
+<p>难点在于「看起来有进展但实际没有」：agent 在反复读同一个文件的不同片段，指纹一直在变，但任务没有推进。所以还需要一个语义层的判据——<strong>距离目标的后置条件还有多远</strong>。这个判断本身需要模型，但它只在看门狗触发时才调用，成本可以接受。</p>
+
+<h3>意图漂移：一个被忽略的问题</h3>
+<p>用户说「帮我订个会议室」，agent 开始执行，中途用户说「算了，改成线上吧」。传统做法是中止重来，但前面已经查过参会人空闲时间——这部分工作不该丢。</p>
+<p>所以意图需要<strong>版本化</strong>：<code>intent@v1</code> → <code>intent@v2</code>，系统计算 diff，判断哪些已完成步骤仍然有效，只重做受影响的部分。这和软件构建系统的增量编译是同一个思路。</p>
+</section>
+
+<section id="s17">
+<h2><span class="num">17</span>多 Agent 并发与冲突<span class="badge">v2 新增</span></h2>
+
+<p>真实使用中，用户会同时有多个意图在跑：后台整理文件、前台查资料、定时任务在归档邮件。它们可能碰同一个文件、同一场会议。</p>
+
+<h3>隔离：每个 agent 一份 overlay</h3>
+<p>沿用投机执行那套 COW 沙箱：每个 agent 从已提交状态 fork 一份写时复制快照，写入只落在 overlay 里。提交时才合并到主状态。这样 agent 之间的中间状态互不可见，也不需要复杂的锁。</p>
+
+<h3>共享：黑板，而不是消息传递</h3>
+<p>Agent 之间需要共享知识（「这个供应商的账期是 60 天」），但直接互相发消息会导致 N² 的连接数。所以用<strong>黑板</strong>：一个只追加的结构化事实库，每条事实带出处和信任标签。Agent 往黑板写，也从黑板读。</p>
+<p>黑板的关键约束：<strong>只追加，不修改</strong>。要推翻一条事实，就追加一条新的并标注它取代了哪条。这样任何时刻都能回溯「当时为什么这么判断」。</p>
+
+<h3>冲突：乐观并发 + 提交时校验</h3>
+<p>不用锁——agent 会长时间持有锁（一个任务可能跑十分钟），锁会导致大面积阻塞。改用数据库那套乐观并发：</p>
+<ul>
+<li>每个 agent 记录自己读过哪些对象、什么版本（读集）</li>
+<li>提交时检查读集是否仍是最新（写集是否与他人冲突）</li>
+<li>冲突则整个事务回滚，agent 重新读取后重试</li>
+</ul>
+<p>这套机制在数据库里已经被验证了几十年，直接搬过来即可。唯一的新问题是<strong>重试可能再次冲突</strong>，需要指数退避 + 上限，超限则升级给人裁决。</p>
+
+<h3>死锁：资源全局排序</h3>
+<p>两个 agent 互相等待对方持有的能力（A 等 B 释放文件锁，B 等 A 释放日历权限）。传统解法是资源全局排序——所有 agent 必须按同一顺序申请资源。这个约束对 agent 来说是可以接受的，因为它们的资源需求是声明式的（第 7 章的效果行），编译期就能排序。</p>
+</section>
+
+<section id="s18">
+<h2><span class="num">18</span>跨设备分布式能力<span class="badge">v2 新增</span></h2>
+
+<p>这个系统不会只活在一台设备上。手机、PC、眼镜、车机、机器人，用户把它们当成一个整体。</p>
+
+<h3>能力可以跨设备委托</h3>
+<p>手机的摄像头是一个能力，可以委托给眼镜上的 agent 使用 60 秒、只读、单次。这比「共享账号」精确得多，也比「投屏」安全得多。</p>
+<p>跨设备委托必须带<strong>设备证明</strong>（attestation）：接收方要能证明自己运行的是未被篡改的系统。没有这个，委托就等于把权限发给了一个未知设备。</p>
+
+<h3>一致性：版本向量</h3>
+<p>现实缓存跨设备时需要同步。用版本向量而不是时间戳——设备的时钟不可信，而版本向量能正确表达「A 看到过 B 的第 3 版，但没看到第 4 版」。</p>
+
+<h3>分区：离线时必须诚实降级</h3>
+<p>设备断连时，最危险的行为是「以为自己在控制另一台设备」。所以跨设备能力必须有<strong>租约</strong>：连接断开超过租约时长，能力自动失效，本地 agent 必须停下来而不是继续执行。</p>
+<p>这条看起来是技术细节，实际上是安全底线。一个以为自己在控制机器人的 agent，如果实际已经失去连接，它的每一条指令都在制造现实世界的错误。</p>
+</section>
+
+<section id="s19">
+<h2><span class="num">19</span>交互与生态</h2>
+
+<h3>意图栏取代启动器</h3>
+<p>主入口不再是图标网格，而是一个输入框——但语义和搜索框完全不同：搜索框返回链接，意图栏返回<strong>已完成的结果或正在进行的任务</strong>。「把上个月的发票整理成报销单」应该直接产出一个填好的表单，而不是十个可能相关的文件。</p>
+<p>关键设计是<strong>渐进披露</strong>：第一屏只给结论和最关键的一个操作；想深究时展开证据（依据了哪些文件、哪几条记忆）；再深一层是完整执行轨迹。绝大多数时候用户停在第一层，但必须随时能下钻——这是信任的来源。</p>
+
+<h3>生成式界面必须被约束</h3>
+<p>让模型直接生成 UI 很诱人，但会带来三个问题：不可测试、不可无障碍访问、不可审计。Loom 的做法是<strong>约束解码到组件词汇表</strong>：系统提供一套经过设计、测试、带无障碍标注的组件，模型只能输出「用哪些组件、什么内容、什么布局」的声明式描述，由系统渲染。</p>
+<p>这样既保留「界面随任务而变」的灵活性，又保证每个像素都来自可信代码。一句话：<em>模型决定说什么，系统决定怎么画</em>。</p>
+
+<h3>环境感知要有可见的开关</h3>
+<p>三条约束：默认全部在端侧处理，原始数据不出设备；任何时候都有物理可见的指示（不是藏在设置里的小圆点）；一键可关，关闭后系统明确降级而不是偷偷继续。</p>
+
+<h3>兼容：不要要求别人重写</h3>
+<p>历史上所有新操作系统的死因几乎相同：没有应用。Loom 的答案是<strong>反向适配</strong>：</p>
+<ul>
+<li><strong>自动化桥接</strong>：通过无障碍树、UI 自动化接口、脚本接口，把已有应用的界面元素暴露成系统工具。老应用不改一行代码就获得被 agent 调用的能力。</li>
+<li><strong>渐进升级</strong>：应用可以选择提供「语义化动作」（推荐），系统就不必猜界面；不提供也能用，只是可靠性低。</li>
+<li><strong>工具即驱动</strong>：把「一个应用能做什么」定义成和设备驱动类似的声明式清单，系统统一编排、鉴权、记账。</li>
+</ul>
+<p>这条路不优雅，可靠性也不如原生集成，但它是唯一能在第一天就有生态的路。</p>
+</section>
+
+<section id="s20">
+<h2><span class="num">20</span>内核实现路径<span class="badge">v2 新增</span></h2>
+
+<p>第 23 章会说明为什么不能从零写内核。这一章说明如果真的要做，该怎么做——核心原则是<strong>不自研已经存在的东西</strong>。</p>
+
+<h3>不自研能力硬件，骑 CHERI</h3>
+<p>能力系统最难的从来不是软件，是硬件。而 CHERI 已经把这部分做完了：带边界、权限、类型和有效位的能力指针，Arm 的 Morello 是首个工业级实现，CheriBSD 已经在上面跑起来了。实测能挡住 70% 以上的内存类漏洞。</p>
+<p>所以内核的能力模型应该直接建立在 CHERI 之上，而不是自己发明一套软件模拟。软件模拟的能力检查每次都要查表，硬件能力检查是免费的——这个差距在系统调用密集的路径上是决定性的。</p>
+
+<h3>不自研微内核，从 seL4 出发</h3>
+<p>seL4 是世界上唯一经过代码级形式化验证的微内核，本身就是能力制的。它的 IPC 性能在微内核里属于第一梯队。从它出发，意味着<strong>可信计算基的正确性已经有了数学证明</strong>，你只需要证明自己加的那部分。</p>
+<p>需要新增到内核的东西很少：agent 对象的生命周期、cgroup 式的五类配额、负能力的传播规则。这三样都要做形式化验证，因为它们直接承载安全属性。</p>
+
+<h3>用户态用 Rust</h3>
+<p>AI 运行时、语义服务、现实缓存这些用户态组件，用 Rust 写。不是因为性能，是因为<strong>内存安全对这类长期运行、处理不可信输入的服务是刚需</strong>。而且 Rust 的类型系统天然适合实现第 7 章的效果类型检查。</p>
+
+<h3>关键路径的验证范围</h3>
+<table>
+<thead><tr><th>组件</th><th>验证强度</th><th>理由</th></tr></thead>
+<tbody>
+<tr><td>能力撤销</td><td>形式化证明</td><td>撤销不彻底等于没有撤销</td></tr>
+<tr><td>负能力传播</td><td>形式化证明</td><td>单调性是安全属性的核心</td></tr>
+<tr><td>IPC 消息隔离</td><td>形式化证明</td><td>seL4 已有，复用即可</td></tr>
+<tr><td>调度器</td><td>模型检验</td><td>不涉及安全，但涉及公平性</td></tr>
+<tr><td>AI 运行时</td><td>不做形式化</td><td>它本来就不被信任</td></tr>
+</tbody>
+</table>
+<p>最后一行是关键：<strong>正因为 AI 运行时不在 TCB 里，它才不需要被验证</strong>。这就是把模型赶出内核的最大回报。</p>
+</section>
+
+<section id="s21">
+<h2><span class="num">21</span>尚未解决的问题</h2>
+
+<p>只讲优点的架构文档没有价值。以下是设计里没有真正解决的问题。</p>
+
+<h3>1. 间接提示注入——语义层仍然未解</h3>
+<p>双模型分离能切断「读到的内容 → 直接执行」，切不断「读到的内容 → 影响计划 → 计划本身看起来完全合理」。攻击者不要求转账，只让 agent「顺便转发给财务」，这看起来毫无问题。类型检查也拦不住——它在类型上完全合法。</p>
+<p>这类语义层操纵目前只能靠概率性检测和人工确认。<strong>这是整个领域未来三到五年最重要的开放问题。</strong></p>
+
+<h3>2. 确定化会不会让系统变僵</h3>
+<p>第 4 章的宏编译是核心创新，但它有个内在张力：宏越多，系统越快，也越难适应变化。如果用户的工作模式变了，一堆宏会持续失效、回退、重编译，反而更慢。</p>
+<p>目前只有「连续失败即降级」这一条粗糙的规则。真正需要的是<strong>宏的生态位管理</strong>——知道哪些宏该保留、哪些该淘汰、哪些该合并。这是个开放问题。</p>
+
+<h3>3. 长任务卡住而不报错</h3>
+<p>第 16 章给了检测思路（状态指纹 + 语义距离），但「语义距离」本身要靠模型判断，而模型可能判断错。一个误判会把正在正常推进的长任务杀掉。</p>
+
+<h3>4. 级联路由的准确率上限</h3>
+<p>小模型处理大部分、难的给大模型，是控成本的唯一现实方案。但「难不难」的判断本身靠分类器，它会犯错，且错误方向不对称：简单问题误判为难的，只是慢一点；难问题误判为简单的，就是错误执行。</p>
+
+<h3>5. 评估体系缺失</h3>
+<p>OSWorld 到 90.2% 了，但它测的是「能不能完成任务」，不测「成本多少、打扰几次、撤销几次」。而这些恰恰是操作系统的核心指标。目前没有公认的 OS 级 benchmark，需要真实的长周期用户数据。</p>
+
+<h3>6. 常驻感知的功耗</h3>
+<p>「随时待命」和「一天一充」直接冲突。可行方向是事件驱动而非轮询：绝大多数时间 NPU 休眠，由廉价传感器或规则引擎触发唤醒。但「什么事件值得唤醒」又是一个准确率问题。</p>
+
+<h3>7. 用户的信任校准</h3>
+<p>用户会走向两个极端：过度信任（不看就点同意）或过度怀疑（每次都拒绝）。第 14 章的注意力拥塞控制能减少打扰，但不能保证每次打扰都问在关键处。这更像产品设计问题，却决定了安全机制的实际有效性。</p>
+
+<h3>8. 标准化的先有鸡还是先有蛋</h3>
+<p>如果每家公司都定义自己的工具描述格式和能力模型，最后是一堆互不兼容的孤岛。这一层需要标准化，但标准化通常发生在市场格局确定之后。</p>
+</section>
+
+<section id="s22">
+<h2><span class="num">22</span>度量体系</h2>
+
+<table>
+<thead><tr><th>指标</th><th>定义</th><th>目标</th><th>为什么重要</th></tr></thead>
+<tbody>
+<tr><td><strong>确定化率</strong></td><td>被确定性路径（L1/L2/L3）服务的意图占比</td><td>一年内 80%</td><td>北极星指标，直接反映系统是否在变好</td></tr>
+<tr><td>一次到位率</td><td>无需追加澄清即完成意图的比例</td><td>&gt; 70%</td><td>核心体验指标</td></tr>
+<tr><td>恰当澄清率</td><td>该问的时候问了 / 总共该问的次数</td><td>&gt; 85%</td><td>衡量系统知不知道自己不知道</td></tr>
+<tr><td>误中断率</td><td>用户认为不值得的打断 / 总打断</td><td>&lt; 5%</td><td>决定安全机制会不会被绕过</td></tr>
+<tr><td>撤销率</td><td>被执行后又撤销的动作比例</td><td>&lt; 3%</td><td>执行质量的直接反映</td></tr>
+<tr><td>首可见反馈</td><td>从提交意图到屏幕有反应</td><td>&lt; 300 ms</td><td>感知性能，与总耗时无关</td></tr>
+<tr><td>每任务搬运量</td><td>字节数（权重 + KV）</td><td>持续下降</td><td>v2 新增，对齐真实瓶颈</td></tr>
+<tr><td>驻留命中率</td><td>请求命中已加载模型的比例</td><td>&gt; 90%</td><td>v2 新增，衡量是否在抖动</td></tr>
+<tr><td>越权拦截率</td><td>被内核拦下的越权尝试 / 总尝试</td><td>&gt; 99.9%</td><td>安全底线</td></tr>
+<tr><td>爆炸半径</td><td>单次失陷可触达的数据量</td><td>越小越好</td><td>比「是否被攻破」更现实</td></tr>
+</tbody>
+</table>
+
+<p>特别注意最后一行。在概率系统里，「不被攻破」不是可达目标，「被攻破后损失可控」才是。这和现代安全工程一致：假设防线会被突破，把资源花在限制后果上。</p>
+</section>
+
+<section id="s23">
+<h2><span class="num">23</span>落地路线</h2>
+
+<p>从零写一个内核是十年、数十亿美元量级的工程。任何声称三年做出新内核的计划都不值得认真对待。</p>
+
+<table>
+<thead><tr><th>阶段</th><th>时间</th><th>做什么</th><th>不做什么</th><th>验证什么</th></tr></thead>
+<tbody>
+<tr><td><strong>P0 外壳</strong></td><td>0–12 月</td><td>在 Linux / Android 之上做意图栏、语义索引、效果总线、能力模型、确定化层</td><td>不碰内核</td><td>交互模型是否成立；确定化率能否爬升</td></tr>
+<tr><td><strong>P1 系统服务</strong></td><td>12–30 月</td><td>替换系统服务层：意图编译器、推理调度、现实缓存、投机执行、双模型分离</td><td>不动内核，沿用现有驱动</td><td>安全模型能否被强制；注入能否结构性阻断</td></tr>
+<tr><td><strong>P2 内核</strong></td><td>30–60 月</td><td>基于 seL4 + CHERI 构建能力原生内核</td><td>不追求全功能，只做能力与隔离</td><td>TCB 能否压到可验证的规模</td></tr>
+</tbody>
+</table>
+
+<h3>MVP：一个垂直切片，而不是一个平台</h3>
+<p>第一版不要做「通用助手」，要做<strong>一条端到端的窄流程</strong>：邮件 + 日历 + 本地文件。用户说「下周去上海出差，帮我把行程排一下」，需要完整走通：</p>
+<pre>理解意图 → 检索历史偏好（记忆）→ 读日历找空档（能力申请）
+→ 查航班（网络工具）→ 生成行程（生成式界面）→ 用户确认
+→ 写日历（事务）→ 可撤销 → <span class="k">第 5 次后编译为宏</span></pre>
+<p>这条流程覆盖了全部核心机制：意图、记忆、能力、事务、生成式 UI、撤销、双模型分离、确定化。它跑通了，架构就成立；跑不通，问题会立刻暴露在最贵的地方之前。</p>
+
+<h3>一个建议的验证顺序</h3>
+<p>不要先做「能力」，先做「约束」。因为能力会随着模型换代自动变强，而约束不会——它只能被设计出来。所以 P0 阶段最该验证的三件事，按优先级：</p>
+<ol>
+<li><strong>确定化率能不能真的爬上去</strong>（如果爬不上去，整个第 4 章的核心命题就错了）</li>
+<li><strong>误中断率能不能压到 5% 以下</strong>（如果压不下去，用户会关掉一切确认）</li>
+<li><strong>类型检查能拦掉多少坏计划</strong>（如果拦不住，静态安全就是空话）</li>
+</ol>
+</section>
+
+<section id="s24">
+<h2><span class="num">24</span>战略定位</h2>
+
+<p>最后一个判断，可能比前面所有技术设计都重要。</p>
+
+<p>PC 和手机上有 Windows、Android、iOS，它们有二十年积累的应用生态、驱动生态、开发者习惯。AI 原生 OS 在这两个战场上没有胜算——不是因为技术不行，是因为<strong>迁移成本由用户承担，而收益是渐进的</strong>。</p>
+
+<p>真正的机会在<strong>没有存量生态的新形态设备</strong>：</p>
+<ul>
+<li><strong>具身智能 / 机器人</strong>：交互天然是「说目标」而非「点按钮」。没有历史应用要兼容，感知—决策—执行的闭环本来就是 OS 该管的事。</li>
+<li><strong>智能座舱</strong>：驾驶场景下用户不能看屏幕、不能点按，意图式交互是唯一合理选择，而不是可选项。</li>
+<li><strong>AI 眼镜 / 可穿戴</strong>：屏幕极小，UI 必须由系统按需生成，固定界面范式根本不成立。</li>
+<li><strong>工业与专用终端</strong>：任务高度结构化，可靠性要求高，正好是「可审计 + 可回滚」价值最大的地方。</li>
+</ul>
+
+<p>这些场景有个共同点：<strong>它们不需要说服用户放弃现有习惯，因为它们本来就是新的</strong>。在这里把架构跑通、把可靠性磨出来，再回头打通用计算，胜率完全不同。</p>
+
+<div class="note prop">
+  <span class="tag">一句话总结</span>
+  <p>这个操作系统的竞争力不在于「模型有多聪明」——那是别人的战场。它在于两件事：<strong>当模型犯错、被欺骗、或干脆不可用时，系统还能保证什么；以及同一个意图重复一百次之后，它是否变得又快又便宜又安全。</strong>前者是操作系统的老承诺，后者是这个时代的新承诺。</p>
+</div>
+</section>
+
+<footer>
+  <p><strong>事实依据</strong>：AIOS（COLM 2025）；Microsoft ACS / MXC / ASSERT（8 个干预点、OPA/Rego 策略、可组合沙箱）；Windows 12 Neural Core；HarmonyOS 6 异构原生调度；macOS 17 端云内存协同；Ubuntu 26.10 eBPF-AI 调度器；OSWorld 与 OSWorld-Human 基准（2026-07 SOTA 90.2%，人类基线 72.36%）；TomasuLLM 乱序投机执行（arXiv 2609.38201）；《Poison Once, Exploit Forever》记忆投毒研究；MCP 工具投毒与 Rug Pull（CVE-2026-59822 等）；CHERI / Arm Morello；seL4 形式化验证微内核；vLLM PagedAttention 与 SGLang RadixAttention。</p>
+  <p><strong>本文提案</strong>（未见于公开实践，需验证）：确定化与意图宏、效果类型系统与静态拒绝、现实缓存一致性协议、负能力的单调传播、注意力拥塞控制、语义投机。这些是设计假设，不是既成事实。</p>
+</footer>
+
+</main>
+</div>
+</body>
+</html>
