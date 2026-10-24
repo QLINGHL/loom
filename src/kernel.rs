@@ -20,7 +20,8 @@
 use crate::capabilities::{CapError, Capability, CapabilityAuthority, LinearCapability, Scope};
 use crate::crypto::sha256_hex;
 use crate::memory::{Memory, MemoryError, Provenance, Recall};
-use crate::schedulers::{AgentGroup, QuotaError, Quotas, TrustScheduler};
+pub use crate::schedulers::{AgentGroup, Quotas};
+use crate::schedulers::{QuotaError, TrustScheduler};
 use crate::speculation::{barrier_for, Barrier, StepProfile};
 use crate::taint::Tainted;
 use crate::tools::{Tool, ToolError, ToolRegistry};
@@ -641,6 +642,12 @@ impl Kernel {
         let mut report = CompensationReport::default();
         let now = self.clock.now_ms();
         for step in steps_reversed {
+            // Read-only steps changed nothing; there is nothing to undo.
+            if let Some(m) = self.registry.manifest(&step.tool) {
+                if !m.has_side_effects() {
+                    continue;
+                }
+            }
             match compensation_status(step, now) {
                 CompStatus::Never => {
                     report.not_compensated.push((step.tool.clone(), "irreversible effect".into()));

@@ -17,6 +17,7 @@ pub mod crypto;
 pub mod determinization;
 pub mod kernel;
 pub mod memory;
+pub mod runtime;
 pub mod schedulers;
 pub mod speculation;
 pub mod taint;
