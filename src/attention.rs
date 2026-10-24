@@ -262,7 +262,6 @@ pub fn max_min_allocate(total: f64, demands: &[(String, f64)]) -> Vec<(String, f
             for &i in &still {
                 result[i].1 += share;
             }
-            remaining = 0.0;
             break;
         }
         unsatisfied = still;
