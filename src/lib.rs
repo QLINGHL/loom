@@ -16,6 +16,7 @@ pub mod blackboard;
 pub mod capabilities;
 pub mod concurrency;
 pub mod crypto;
+pub mod delegation;
 pub mod determinization;
 pub mod kernel;
 pub mod memory;
