@@ -27,6 +27,7 @@ pub mod taint;
 pub mod tools;
 pub mod transactions;
 pub mod typesys;
+pub mod version_vector;
 pub mod watchdog;
 pub mod worldcache;
 
