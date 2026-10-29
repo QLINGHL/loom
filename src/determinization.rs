@@ -24,8 +24,10 @@
 
 use crate::crypto::sha256_hex;
 use crate::typesys::{Facts, Plan};
+use crate::Clock;
 use crate::Value;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 /// Consecutive precondition failures that demote a macro (doc ch. 4).
 pub const DEMOTE_THRESHOLD: u32 = 3;
@@ -68,6 +70,14 @@ pub struct Macro {
     pub schema_versions: HashMap<String, u32>,
     pub stable_runs: u32,
     pub consecutive_pre_failures: u32,
+    /// Wall-clock ms at compile time, when the engine was built with a
+    /// clock. `None` means the age is unknown — the macro ecology (ch. 21)
+    /// never prunes a macro whose age it cannot prove.
+    pub created_ms: Option<u64>,
+    /// Wall-clock ms of the last *successful* macro run. A failed attempt
+    /// (precondition failure, missing slot) does not refresh this: a stale
+    /// macro must not be kept alive by repeatedly failing.
+    pub last_used_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +155,10 @@ pub struct DetEngine {
     recompile_queue: Vec<String>,
     l1_hits: u64,
     l2_hits: u64,
+    /// Optional time source. `None` (the `new()` case) keeps the engine
+    /// fully deterministic with no wall-clock dependence; macro age is
+    /// then unknown and ecology pruning is disabled for those macros.
+    clock: Option<Rc<dyn Clock>>,
 }
 
 impl DetEngine {
@@ -157,7 +171,20 @@ impl DetEngine {
             recompile_queue: Vec::new(),
             l1_hits: 0,
             l2_hits: 0,
+            clock: None,
         }
+    }
+
+    /// Build an engine that timestamps macro compilation and successful
+    /// macro runs, so the macro ecology can judge idleness.
+    pub fn with_clock(clock: Rc<dyn Clock>) -> Self {
+        let mut engine = Self::new();
+        engine.clock = Some(clock);
+        engine
+    }
+
+    fn now_ms(&self) -> Option<u64> {
+        self.clock.as_ref().map(|c| c.now_ms())
     }
 
     // -- Recording --------------------------------------------------------
@@ -269,6 +296,8 @@ impl DetEngine {
             schema_versions: rec.schema_versions.clone(),
             stable_runs: 0,
             consecutive_pre_failures: 0,
+            created_ms: self.now_ms(),
+            last_used_ms: self.now_ms(),
         };
         self.macros.insert(intent_key.to_string(), mac.clone());
         Ok(mac)
@@ -340,11 +369,33 @@ impl DetEngine {
             plan.steps[*step_idx].args.set_path(&split, value.clone());
         }
 
+        let now = self.now_ms();
         let entry = self.macros.get_mut(intent_key).expect("present");
         entry.consecutive_pre_failures = 0;
         entry.stable_runs += 1;
+        if let Some(now) = now {
+            entry.last_used_ms = Some(now);
+        }
         self.l2_hits += 1;
         Ok(plan)
+    }
+
+    /// All live macros, sorted by intent key (deterministic order for
+    /// ecology reports). The macro ecology reads through this snapshot
+    /// and prunes through [`DetEngine::remove_macro`].
+    pub fn macros_snapshot(&self) -> Vec<Macro> {
+        let mut macros: Vec<Macro> = self.macros.values().cloned().collect();
+        macros.sort_by(|a, b| a.intent_key.cmp(&b.intent_key));
+        macros
+    }
+
+    /// Remove a macro and any trigger armed for it, so a pruned macro
+    /// leaves no dangling trigger behind. Returns the removed macro.
+    /// (Pre-existing demotion/invalidation paths deliberately keep their
+    /// own behaviour and do not go through this.)
+    pub fn remove_macro(&mut self, intent_key: &str) -> Option<Macro> {
+        self.triggers.remove(intent_key);
+        self.macros.remove(intent_key)
     }
 
     pub fn recompile_queue(&self) -> &[String] {

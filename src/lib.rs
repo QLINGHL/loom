@@ -19,6 +19,7 @@ pub mod crypto;
 pub mod delegation;
 pub mod determinization;
 pub mod kernel;
+pub mod macro_ecology;
 pub mod memory;
 pub mod metrics;
 pub mod runtime;
