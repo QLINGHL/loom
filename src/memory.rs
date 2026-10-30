@@ -104,6 +104,11 @@ pub struct MemoryItem {
     pub recall_count: u32,
     /// Distinct source ids that have asserted the same key+fact.
     pub corroborations: HashSet<String>,
+    /// Set by [`Memory::run_checkup`] when the item fails the periodic
+    /// memory checkup (doc ch. 10). Marking is not deletion or demotion:
+    /// the fact stays recallable until a human reviews it and calls
+    /// [`Memory::clear_review`].
+    pub pending_review: bool,
 }
 
 impl MemoryItem {
@@ -170,6 +175,58 @@ pub struct Recall {
 pub struct HealthFlag {
     pub id: u64,
     pub issue: String,
+}
+
+/// One reason a memory checkup flagged an item (doc ch. 10, "定期记忆体检").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CheckupIssue {
+    /// Provenance degraded to an empty source: the fact can no longer say
+    /// where it came from, so it must not be trusted as confirmed memory.
+    NoProvenance,
+    /// Nothing ever recalled it and no second source corroborated it, so
+    /// no reasoning chain references it.
+    Isolated,
+    /// Same key as a confirmed (L2) fact but a different fact text.
+    ContradictsConfirmed,
+}
+
+impl CheckupIssue {
+    pub fn describe(self) -> &'static str {
+        match self {
+            CheckupIssue::NoProvenance => "no provenance: empty source id",
+            CheckupIssue::Isolated => "isolated: never recalled and uncorroborated",
+            CheckupIssue::ContradictsConfirmed => "contradicts a confirmed (L2) fact",
+        }
+    }
+}
+
+/// One item flagged by [`Memory::run_checkup`]. An item can carry several
+/// flags (e.g. both isolated and contradicting a confirmed fact).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckupFlag {
+    pub id: u64,
+    pub issue: CheckupIssue,
+    pub reason: String,
+}
+
+/// Result of one [`Memory::run_checkup`] run. `flags` lists every failing
+/// item (including ones already marked by an earlier run); `newly_marked`
+/// counts only items this run marked for the first time, so a repeated
+/// run is idempotent in its marking effect.
+#[derive(Debug, Clone)]
+pub struct CheckupReport {
+    pub flags: Vec<CheckupFlag>,
+    pub newly_marked: usize,
+}
+
+impl CheckupReport {
+    /// Distinct item ids flagged, in ascending order.
+    pub fn flagged_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self.flags.iter().map(|f| f.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
 }
 
 /// Confidence below which recall must escalate to a human (doc ch. 8).
@@ -269,6 +326,7 @@ impl Memory {
                 expires_ms: ttl_ms.map(|t| now + t),
                 recall_count: 0,
                 corroborations,
+                pending_review: false,
             },
         );
         Ok(id)
@@ -411,6 +469,115 @@ impl Memory {
             }
         }
         flags
+    }
+
+    /// Periodic memory checkup (doc ch. 10, "定期记忆体检"): scan live
+    /// memory (L1+L2) for the three checkup categories and mark every
+    /// failing item `pending_review` so a human can review it.
+    ///
+    /// * **No provenance** — the item's provenance source id is empty, so
+    ///   the fact no longer says where it came from. (`assert_fact`
+    ///   rejects a missing `Provenance` outright, but a degraded or
+    ///   imported item can still arrive with an empty source id; the
+    ///   checkup is the net that catches it.)
+    /// * **Isolated** — never recalled *and* corroborated by no source
+    ///   beyond its own, so no reasoning chain references it.
+    /// * **Contradicts a confirmed fact** — same key as an L2 fact with a
+    ///   different fact text. The L2 fact is the reference and is not
+    ///   itself flagged by an L1 challenger; two contradicting L2 facts
+    ///   flag each other.
+    ///
+    /// Expired items are skipped (they are already invisible to recall)
+    /// and L3 is skipped (the archive is append-only: its contents are
+    /// history, not live memory to mark). Flagging never deletes,
+    /// demotes, or hides an item — it only marks it for human review.
+    /// This differs from [`Memory::health_scan`], which only reports
+    /// flags (L2 only, including staleness) without marking anything.
+    pub fn run_checkup(&mut self) -> CheckupReport {
+        let now = self.clock.now_ms();
+        let mut live: Vec<&MemoryItem> = self
+            .items
+            .values()
+            .filter(|i| matches!(i.level, Level::L1 | Level::L2) && !i.is_expired(now))
+            .collect();
+        live.sort_by_key(|i| i.id);
+        let confirmed: Vec<&MemoryItem> =
+            live.iter().filter(|i| i.level == Level::L2).copied().collect();
+
+        let mut flags = Vec::new();
+        for item in &live {
+            if item.provenance.source_id.trim().is_empty() {
+                flags.push(CheckupFlag {
+                    id: item.id,
+                    issue: CheckupIssue::NoProvenance,
+                    reason: CheckupIssue::NoProvenance.describe().to_string(),
+                });
+            }
+            if item.recall_count == 0 && item.corroborations.len() <= 1 {
+                flags.push(CheckupFlag {
+                    id: item.id,
+                    issue: CheckupIssue::Isolated,
+                    reason: CheckupIssue::Isolated.describe().to_string(),
+                });
+            }
+            // An L2 item is contradicted by any other confirmed (L2)
+            // fact with the same key; an L1 item is contradicted by a
+            // confirmed fact. The confirmed set is exactly the L2 set,
+            // so for L1 the "other" check is unnecessary — the item
+            // itself is never in the confirmed set.
+            let contradicts = match item.level {
+                Level::L2 => confirmed
+                    .iter()
+                    .any(|c| c.id != item.id && c.key == item.key && c.fact != item.fact),
+                Level::L1 => {
+                    confirmed.iter().any(|c| c.key == item.key && c.fact != item.fact)
+                }
+                _ => false,
+            };
+            if contradicts {
+                flags.push(CheckupFlag {
+                    id: item.id,
+                    issue: CheckupIssue::ContradictsConfirmed,
+                    reason: CheckupIssue::ContradictsConfirmed.describe().to_string(),
+                });
+            }
+        }
+
+        // Marking is idempotent: a second flag for an already-marked
+        // item finds `pending_review` set and does not double-count.
+        let mut newly_marked = 0;
+        for flag in &flags {
+            if let Some(item) = self.items.get_mut(&flag.id) {
+                if !item.pending_review {
+                    item.pending_review = true;
+                    newly_marked += 1;
+                }
+            }
+        }
+        CheckupReport { flags, newly_marked }
+    }
+
+    /// Items currently awaiting human review after a checkup, by id order.
+    pub fn pending_review_items(&self) -> Vec<&MemoryItem> {
+        let mut items: Vec<&MemoryItem> =
+            self.items.values().filter(|i| i.pending_review).collect();
+        items.sort_by_key(|i| i.id);
+        items
+    }
+
+    /// Human review resolution: clear the pending-review mark on an item
+    /// after reviewing it. The fact itself is untouched — clearing only
+    /// says a human has looked at it. L3 is append-only, so clearing a
+    /// mark there is refused by design (checkup never marks L3 anyway).
+    pub fn clear_review(&mut self, id: u64) -> Result<(), MemoryError> {
+        match self.items.get_mut(&id) {
+            None => Err(MemoryError::NotFound { id }),
+            Some(i) if i.level == Level::L3 => Err(MemoryError::Archived { id }),
+            Some(i) => {
+                i.pending_review = false;
+                Ok(())
+            }
+        }
     }
 
     pub fn get(&self, id: u64) -> Option<&MemoryItem> {
@@ -607,6 +774,130 @@ mod tests {
         mem.promote(b).unwrap();
         let flags = mem.health_scan();
         assert!(flags.iter().any(|f| f.issue.contains("contradicted")));
+    }
+
+    #[test]
+    fn checkup_flags_no_provenance_and_marks_pending_review() {
+        let (mut mem, c) = setup();
+        // Degraded provenance: the write carried a Provenance, but its
+        // source id is empty, so the fact can no longer say where it
+        // came from.
+        let degraded = Provenance::new(SourceKind::UserDirect, "", c.now_ms(), 0.9);
+        let id = mem
+            .assert_fact("seat", "window seat", FactCategory::Preference, Some(degraded), None)
+            .unwrap();
+        let report = mem.run_checkup();
+        assert!(report.flags.iter().any(|f| f.id == id && f.issue == CheckupIssue::NoProvenance));
+        assert_eq!(report.newly_marked, 1);
+        assert!(mem.get(id).unwrap().pending_review);
+        assert_eq!(mem.pending_review_items().len(), 1);
+        // Human review resolves the mark without touching the fact.
+        mem.clear_review(id).unwrap();
+        assert!(!mem.get(id).unwrap().pending_review);
+        assert!(mem.pending_review_items().is_empty());
+        assert_eq!(mem.get(id).unwrap().fact, "window seat");
+        assert_eq!(mem.clear_review(9999), Err(MemoryError::NotFound { id: 9999 }));
+    }
+
+    #[test]
+    fn checkup_isolated_means_unrecalled_and_uncorroborated() {
+        let (mut mem, c) = setup();
+        let lonely = mem
+            .assert_fact("lonely", "never used fact", FactCategory::General, Some(prov(&c, 0.9)), None)
+            .unwrap();
+        let recalled = mem
+            .assert_fact("used", "recalled fact", FactCategory::General, Some(prov(&c, 0.9)), None)
+            .unwrap();
+        // Query with a token unique to this item, so the recall does
+        // not incidentally count toward the other items.
+        mem.recall("recalled", 0.1, false);
+        // Corroborated by a second independent source, never recalled:
+        // referenced by a reasoning chain via corroboration, not isolated.
+        let signed = Provenance::new(SourceKind::SystemSigned, "system", c.now_ms(), 0.9);
+        let backed = mem
+            .assert_fact("backed", "corroborated fact", FactCategory::General, Some(prov(&c, 0.9)), None)
+            .unwrap();
+        mem.assert_fact("backed", "corroborated fact", FactCategory::General, Some(signed), None)
+            .unwrap();
+        let report = mem.run_checkup();
+        assert!(report.flags.iter().any(|f| f.id == lonely && f.issue == CheckupIssue::Isolated));
+        assert!(!report.flags.iter().any(|f| f.id == recalled && f.issue == CheckupIssue::Isolated));
+        assert!(!report.flags.iter().any(|f| f.id == backed && f.issue == CheckupIssue::Isolated));
+        assert_eq!(report.flagged_ids(), vec![lonely]);
+    }
+
+    #[test]
+    fn checkup_flags_l1_contradicting_confirmed_l2_but_not_the_l2_itself() {
+        let (mut mem, c) = setup();
+        let confirmed = mem
+            .assert_fact("home.airport", "home airport is PVG", FactCategory::Preference, Some(prov(&c, 0.95)), None)
+            .unwrap();
+        mem.promote(confirmed).unwrap();
+        mem.recall("home airport PVG", 0.1, false);
+        let challenger = mem
+            .assert_fact("home.airport", "home airport is SHA", FactCategory::Preference, Some(prov(&c, 0.95)), None)
+            .unwrap();
+        let report = mem.run_checkup();
+        assert!(report
+            .flags
+            .iter()
+            .any(|f| f.id == challenger && f.issue == CheckupIssue::ContradictsConfirmed));
+        assert!(!report
+            .flags
+            .iter()
+            .any(|f| f.id == confirmed && f.issue == CheckupIssue::ContradictsConfirmed));
+        assert!(mem.get(challenger).unwrap().pending_review);
+        assert!(!mem.get(confirmed).unwrap().pending_review);
+    }
+
+    #[test]
+    fn checkup_two_contradicting_l2_facts_flag_each_other() {
+        let (mut mem, c) = setup();
+        let a = mem
+            .assert_fact("home.airport", "home airport is PVG", FactCategory::Preference, Some(prov(&c, 0.95)), None)
+            .unwrap();
+        let b = mem
+            .assert_fact("home.airport", "home airport is SHA", FactCategory::Preference, Some(prov(&c, 0.95)), None)
+            .unwrap();
+        mem.promote(a).unwrap();
+        mem.promote(b).unwrap();
+        mem.recall("home airport", 0.1, false);
+        let report = mem.run_checkup();
+        assert!(report.flags.iter().any(|f| f.id == a && f.issue == CheckupIssue::ContradictsConfirmed));
+        assert!(report.flags.iter().any(|f| f.id == b && f.issue == CheckupIssue::ContradictsConfirmed));
+        assert_eq!(report.flagged_ids(), vec![a, b]);
+    }
+
+    #[test]
+    fn checkup_marking_is_idempotent() {
+        let (mut mem, c) = setup();
+        let id = mem
+            .assert_fact("lonely", "never used fact", FactCategory::General, Some(prov(&c, 0.9)), None)
+            .unwrap();
+        let first = mem.run_checkup();
+        assert_eq!(first.newly_marked, 1);
+        let second = mem.run_checkup();
+        assert_eq!(second.flags, first.flags, "re-run must report the same flags");
+        assert_eq!(second.newly_marked, 0, "re-run must not re-count the same item");
+        assert!(mem.get(id).unwrap().pending_review);
+    }
+
+    #[test]
+    fn checkup_skips_expired_and_archived_items() {
+        let (mut mem, c) = setup();
+        let expired = mem
+            .assert_fact("gate", "gate is B7", FactCategory::General, Some(prov(&c, 0.9)), Some(1_000))
+            .unwrap();
+        let archived = mem
+            .assert_fact("seat", "window seat", FactCategory::Preference, Some(prov(&c, 0.95)), None)
+            .unwrap();
+        mem.promote(archived).unwrap();
+        mem.archive(archived).unwrap();
+        c.advance(2_000);
+        let report = mem.run_checkup();
+        assert!(!report.flags.iter().any(|f| f.id == expired));
+        assert!(!report.flags.iter().any(|f| f.id == archived));
+        assert!(report.flags.is_empty());
     }
 
     #[test]
