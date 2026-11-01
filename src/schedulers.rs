@@ -16,6 +16,12 @@
 //! * **Admission control** — inference is non-preemptible, so a request
 //!   whose estimated latency exceeds the interactive budget is queued or
 //!   downgraded to the small model instead of being "preempted later".
+//! * **Block-boundary yield** — a long background decode is split into
+//!   blocks of N tokens; at each block boundary the scheduler checks
+//!   whether an interactive (higher-priority) request is pending and, if
+//!   so, yields without consuming any token of the next block. A block
+//!   once started always runs to completion: there is no mid-block
+//!   preemption, because the NPU cannot be swapped out mid-inference.
 
 use crate::typesys::Risk;
 use std::collections::HashMap;
@@ -91,6 +97,10 @@ pub struct InferenceScheduler {
     pub resident_hits: u64,
     pub resident_requests: u64,
     pub prefix_hits: u64,
+    /// Blocks completed by chunked decodes (see `run_block`).
+    pub blocks_run: u64,
+    /// Times a chunked decode yielded at a block boundary.
+    pub block_yields: u64,
 }
 
 impl InferenceScheduler {
@@ -107,6 +117,8 @@ impl InferenceScheduler {
             resident_hits: 0,
             resident_requests: 0,
             prefix_hits: 0,
+            blocks_run: 0,
+            block_yields: 0,
         }
     }
 
@@ -258,6 +270,105 @@ impl InferenceScheduler {
             bytes_moved,
             est_latency_ms,
             admission: Admission::Admitted,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chunked decode with block-boundary yield (doc ch. 9)
+// ---------------------------------------------------------------------------
+
+/// A long decode split into blocks so a background job can yield to an
+/// interactive request. Priority here is exactly the request's
+/// `interactive` flag: interactive work holds the reserved real-time
+/// channel, background work fills the remainder. A pending request only
+/// preempts at a boundary and only when it is strictly higher priority
+/// than the running job, so an interactive job never yields and a
+/// background job never yields to another background job.
+#[derive(Debug, Clone)]
+pub struct ChunkedJob {
+    request: InferenceRequest,
+    /// Tokens already generated; also the resume point after a yield.
+    pub generated: u32,
+    /// Blocks completed so far (a yielded block is not counted).
+    pub blocks: u64,
+    /// Times this job has yielded at a boundary.
+    pub yields: u64,
+    pub finished: bool,
+}
+
+/// Outcome of one `run_block` call. `Yielded` consumes nothing: the
+/// caller retries the same block later and no token is lost or duplicated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockOutcome {
+    /// The block ran to completion; `generated` / `remaining` are post-block.
+    Advanced { generated: u32, remaining: u32 },
+    /// A higher-priority request was pending at the boundary; the block
+    /// did not start. `generated` / `remaining` are unchanged.
+    Yielded { generated: u32, remaining: u32 },
+    /// The job has generated all its output tokens.
+    Completed { generated: u32 },
+    /// The block was admission-queued (interactive over budget); like a
+    /// yield, it consumed nothing and may be retried later.
+    Queued { generated: u32, remaining: u32 },
+}
+
+impl InferenceScheduler {
+    /// Start a chunked decode. Nothing runs yet: the first block is not a
+    /// boundary, so it always runs even if a higher-priority request is
+    /// already pending (the scheduler would simply not have started the
+    /// job in that case; once started, only boundaries yield).
+    pub fn start_chunked(&self, req: &InferenceRequest) -> ChunkedJob {
+        ChunkedJob {
+            request: req.clone(),
+            generated: 0,
+            blocks: 0,
+            yields: 0,
+            finished: req.output_tokens == 0,
+        }
+    }
+
+    /// Run one block of at most `block_tokens` tokens for `job`.
+    ///
+    /// Boundary rule, in order: a finished job stays finished; a job
+    /// that has not completed any block yet runs its first block
+    /// unconditionally; afterwards, if `interactive_pending` is set and
+    /// the running job is background work, the block does not start and
+    /// the job yields. Each block reuses the existing routing, resident
+    /// set and prefix cache, so a resumed job pays no weight reload and
+    /// no prefix KV twice.
+    pub fn run_block(
+        &mut self,
+        job: &mut ChunkedJob,
+        block_tokens: u32,
+        interactive_pending: bool,
+    ) -> BlockOutcome {
+        if job.finished {
+            return BlockOutcome::Completed { generated: job.generated };
+        }
+        let remaining = job.request.output_tokens - job.generated;
+        if job.blocks > 0 && interactive_pending && !job.request.interactive {
+            job.yields += 1;
+            self.block_yields += 1;
+            return BlockOutcome::Yielded { generated: job.generated, remaining };
+        }
+        let block = block_tokens.max(1).min(remaining);
+        let sub = InferenceRequest { output_tokens: block, ..job.request.clone() };
+        let decision = self.route(&sub);
+        if decision.admission == Admission::Queued {
+            return BlockOutcome::Queued { generated: job.generated, remaining };
+        }
+        job.generated += block;
+        job.blocks += 1;
+        self.blocks_run += 1;
+        if job.generated >= job.request.output_tokens {
+            job.finished = true;
+            BlockOutcome::Completed { generated: job.generated }
+        } else {
+            BlockOutcome::Advanced {
+                generated: job.generated,
+                remaining: job.request.output_tokens - job.generated,
+            }
         }
     }
 }
@@ -513,6 +624,93 @@ mod tests {
         let mut sched = InferenceScheduler::new(models(), 1_000);
         let d = sched.route(&request(true, false, 10));
         assert_eq!(d.admission, Admission::Admitted);
+    }
+
+    fn chunked_request(output_tokens: u32, interactive: bool) -> InferenceRequest {
+        InferenceRequest { output_tokens, ..request(false, interactive, u64::MAX) }
+    }
+
+    #[test]
+    fn background_decode_yields_at_block_boundary_and_resumes_losslessly() {
+        let mut sched = InferenceScheduler::new(models(), 1_000_000);
+        let mut job = sched.start_chunked(&chunked_request(40, false));
+        // First block is not a boundary: it runs even with a pending
+        // interactive request.
+        assert_eq!(
+            sched.run_block(&mut job, 16, true),
+            BlockOutcome::Advanced { generated: 16, remaining: 24 }
+        );
+        // At the boundary the pending interactive request wins: the next
+        // block does not start and no token is consumed.
+        assert_eq!(
+            sched.run_block(&mut job, 16, true),
+            BlockOutcome::Yielded { generated: 16, remaining: 24 }
+        );
+        assert_eq!(job.yields, 1);
+        assert_eq!(sched.block_yields, 1);
+        // Yielding again costs nothing either.
+        assert_eq!(
+            sched.run_block(&mut job, 16, true),
+            BlockOutcome::Yielded { generated: 16, remaining: 24 }
+        );
+        // Once the pending request clears, the job resumes from exactly
+        // where it yielded and finishes with a partial final block.
+        assert_eq!(
+            sched.run_block(&mut job, 16, false),
+            BlockOutcome::Advanced { generated: 32, remaining: 8 }
+        );
+        assert_eq!(
+            sched.run_block(&mut job, 16, false),
+            BlockOutcome::Completed { generated: 40 }
+        );
+        assert!(job.finished);
+        assert_eq!(job.blocks, 3, "16 + 16 + 8, no block lost or duplicated");
+        // A finished job stays finished and moves no more bytes.
+        let bytes = sched.total_bytes_moved;
+        assert_eq!(sched.run_block(&mut job, 16, false), BlockOutcome::Completed { generated: 40 });
+        assert_eq!(sched.total_bytes_moved, bytes);
+    }
+
+    #[test]
+    fn yield_needs_strictly_higher_priority() {
+        let mut sched = InferenceScheduler::new(models(), 1_000_000);
+        // Background job, no interactive pending: no yield.
+        let mut bg = sched.start_chunked(&chunked_request(32, false));
+        sched.run_block(&mut bg, 16, false);
+        assert_eq!(
+            sched.run_block(&mut bg, 16, false),
+            BlockOutcome::Completed { generated: 32 }
+        );
+        // Interactive job never yields, even to an interactive pending
+        // request: it holds the reserved real-time channel.
+        let mut fg = sched.start_chunked(&chunked_request(32, true));
+        sched.run_block(&mut fg, 16, false);
+        assert_eq!(
+            sched.run_block(&mut fg, 16, true),
+            BlockOutcome::Completed { generated: 32 }
+        );
+        assert_eq!(fg.yields, 0);
+    }
+
+    #[test]
+    fn resumed_job_pays_no_second_weight_reload_or_prefix() {
+        let mut sched = InferenceScheduler::new(models(), 1_000_000);
+        let mut job = sched.start_chunked(&chunked_request(200, false));
+        sched.run_block(&mut job, 100, false);
+        let bytes_after_first = sched.total_bytes_moved;
+        // Yield at the boundary, then resume: only the next block's
+        // output KV moves, no weight reload and no prefix KV again.
+        assert!(matches!(sched.run_block(&mut job, 100, true), BlockOutcome::Yielded { .. }));
+        sched.run_block(&mut job, 100, false);
+        assert_eq!(sched.total_bytes_moved - bytes_after_first, 100_000, "100 output tokens x 1,000 KV bytes");
+    }
+
+    #[test]
+    fn zero_token_chunked_job_is_immediately_complete() {
+        let mut sched = InferenceScheduler::new(models(), 1_000_000);
+        let mut job = sched.start_chunked(&chunked_request(0, false));
+        assert_eq!(sched.run_block(&mut job, 16, true), BlockOutcome::Completed { generated: 0 });
+        assert_eq!(sched.total_bytes_moved, 0);
     }
 
     #[test]
