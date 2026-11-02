@@ -542,6 +542,164 @@ impl AgentGroup {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Context scheduler: semantic page faults (doc ch. 9)
+// ---------------------------------------------------------------------------
+
+/// A semantic page fault: a recall that did not land cleanly. Unlike a
+/// real MMU fault, a semantic fault is probabilistic — the recall may
+/// have returned the wrong thing, or nothing at all — so the fault carries
+/// an explicit confidence instead of a guaranteed backing page. The
+/// scheduler turns "I don't know" into a schedulable event instead of
+/// letting the model fabricate an answer.
+#[derive(Debug, Clone)]
+pub struct SemanticFault {
+    pub query: String,
+    /// Explicit page-fault confidence in [0, 1]; NaN is treated as 0.
+    pub confidence: f64,
+    /// Rephrase attempts already spent on this fault (0 on first sight).
+    pub attempt: u32,
+}
+
+/// Which tier a confidence value falls in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultLevel {
+    /// High enough to use as-is.
+    High,
+    /// Worth one more try with a different phrasing / supplementary
+    /// retrieval, within the retry budget.
+    Medium,
+    /// Too low to trust: stop and ask the human.
+    Low,
+}
+
+/// Outcome of handling one semantic page fault. There is deliberately no
+/// "fabricate" outcome: every path either uses a trusted recall, retries
+/// with a genuinely different query, or yields to the human.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FaultOutcome {
+    /// Confidence high: use the recalled context directly.
+    UseDirectly { confidence: f64 },
+    /// Confidence medium and budget remains: retry with this query.
+    RetryRephrased { attempt: u32, rephrased_query: String },
+    /// Confidence low, retries exhausted, or rephrasing made no
+    /// progress: stop and ask the human instead of guessing.
+    YieldToHuman { question: String, confidence: f64 },
+}
+
+pub struct ContextScheduler {
+    /// `confidence >= high_threshold` uses the recall directly.
+    pub high_threshold: f64,
+    /// `medium_threshold <= confidence < high_threshold` retries.
+    pub medium_threshold: f64,
+    /// Max rephrase attempts per fault before escalating to a yield.
+    pub max_retries: u32,
+    pub faults_seen: u64,
+    pub direct_uses: u64,
+    pub retries: u64,
+    pub yields: u64,
+}
+
+impl ContextScheduler {
+    /// Defaults: high 0.8, medium 0.5, at most 2 rephrase attempts.
+    pub fn new() -> Self {
+        ContextScheduler {
+            high_threshold: 0.8,
+            medium_threshold: 0.5,
+            max_retries: 2,
+            faults_seen: 0,
+            direct_uses: 0,
+            retries: 0,
+            yields: 0,
+        }
+    }
+
+    /// Custom thresholds, clamped to [0, 1]; `medium` is capped at `high`
+    /// so the three tiers always partition the range without overlap.
+    pub fn with_thresholds(high: f64, medium: f64, max_retries: u32) -> Self {
+        let high = if high.is_nan() { 0.8 } else { high.clamp(0.0, 1.0) };
+        let medium = if medium.is_nan() { 0.5 } else { medium.clamp(0.0, 1.0) };
+        ContextScheduler {
+            high_threshold: high,
+            medium_threshold: medium.min(high),
+            max_retries,
+            faults_seen: 0,
+            direct_uses: 0,
+            retries: 0,
+            yields: 0,
+        }
+    }
+
+    fn sanitize(confidence: f64) -> f64 {
+        if confidence.is_nan() { 0.0 } else { confidence.clamp(0.0, 1.0) }
+    }
+
+    pub fn classify(&self, confidence: f64) -> FaultLevel {
+        let c = Self::sanitize(confidence);
+        if c >= self.high_threshold {
+            FaultLevel::High
+        } else if c >= self.medium_threshold {
+            FaultLevel::Medium
+        } else {
+            FaultLevel::Low
+        }
+    }
+
+    fn yield_to_human(&mut self, fault: &SemanticFault, confidence: f64) -> FaultOutcome {
+        self.yields += 1;
+        FaultOutcome::YieldToHuman {
+            question: format!(
+                "上下文召回置信度过低（{confidence:.2}），无法可靠回答，请确认：{}",
+                fault.query
+            ),
+            confidence,
+        }
+    }
+
+    /// Handle one semantic page fault.
+    ///
+    /// `rephrase` maps `(query, next_attempt)` to a new query — the
+    /// "换表述重试 / 补充检索" step. It is the caller's job to actually
+    /// change the phrasing; if it returns the original query (or an
+    /// empty one), the fault escalates to a yield rather than looping
+    /// forever on the same recall.
+    pub fn resolve(
+        &mut self,
+        fault: &SemanticFault,
+        rephrase: &dyn Fn(&str, u32) -> String,
+    ) -> FaultOutcome {
+        self.faults_seen += 1;
+        let confidence = Self::sanitize(fault.confidence);
+        match self.classify(confidence) {
+            FaultLevel::High => {
+                self.direct_uses += 1;
+                FaultOutcome::UseDirectly { confidence }
+            }
+            FaultLevel::Low => self.yield_to_human(fault, confidence),
+            FaultLevel::Medium => {
+                if fault.attempt >= self.max_retries {
+                    // Still not high after the budget: escalate, never
+                    // fabricate from a medium-confidence recall.
+                    return self.yield_to_human(fault, confidence);
+                }
+                let next_attempt = fault.attempt + 1;
+                let rephrased = rephrase(&fault.query, next_attempt);
+                if rephrased.trim().is_empty() || rephrased == fault.query {
+                    return self.yield_to_human(fault, confidence);
+                }
+                self.retries += 1;
+                FaultOutcome::RetryRephrased { attempt: next_attempt, rephrased_query: rephrased }
+            }
+        }
+    }
+}
+
+impl Default for ContextScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,5 +911,111 @@ mod tests {
         assert_eq!(g.try_consume_side_effect(), Err(QuotaError::SideEffects));
         assert!(g.try_consume_attention().is_ok());
         assert_eq!(g.try_consume_attention(), Err(QuotaError::Attention));
+    }
+
+    fn fault(query: &str, confidence: f64, attempt: u32) -> SemanticFault {
+        SemanticFault { query: query.into(), confidence, attempt }
+    }
+
+    fn rephrase_suffix(query: &str, attempt: u32) -> String {
+        format!("{query}（换表述第{attempt}次）")
+    }
+
+    #[test]
+    fn high_confidence_fault_is_used_directly() {
+        let mut sched = ContextScheduler::new();
+        assert_eq!(
+            sched.resolve(&fault("用户喜欢靠窗座位吗", 0.9, 0), &rephrase_suffix),
+            FaultOutcome::UseDirectly { confidence: 0.9 }
+        );
+        assert_eq!(sched.direct_uses, 1);
+        assert_eq!(sched.faults_seen, 1);
+    }
+
+    #[test]
+    fn thresholds_partition_the_range_at_the_boundaries() {
+        let sched = ContextScheduler::new();
+        assert_eq!(sched.classify(0.8), FaultLevel::High, "exactly high uses directly");
+        assert_eq!(sched.classify(0.799), FaultLevel::Medium);
+        assert_eq!(sched.classify(0.5), FaultLevel::Medium, "exactly medium retries");
+        assert_eq!(sched.classify(0.499), FaultLevel::Low);
+    }
+
+    #[test]
+    fn medium_confidence_retries_with_a_rephrased_query() {
+        let mut sched = ContextScheduler::new();
+        assert_eq!(
+            sched.resolve(&fault("用户喜欢靠窗座位吗", 0.6, 0), &rephrase_suffix),
+            FaultOutcome::RetryRephrased {
+                attempt: 1,
+                rephrased_query: "用户喜欢靠窗座位吗（换表述第1次）".into(),
+            }
+        );
+        assert_eq!(sched.retries, 1);
+        // A second medium fault for the same query keeps counting attempts.
+        assert_eq!(
+            sched.resolve(&fault("用户喜欢靠窗座位吗", 0.6, 1), &rephrase_suffix),
+            FaultOutcome::RetryRephrased {
+                attempt: 2,
+                rephrased_query: "用户喜欢靠窗座位吗（换表述第2次）".into(),
+            }
+        );
+        assert_eq!(sched.retries, 2);
+    }
+
+    #[test]
+    fn exhausted_retry_budget_escalates_to_yield_never_fabricates() {
+        let mut sched = ContextScheduler::new();
+        let outcome = sched.resolve(&fault("用户喜欢靠窗座位吗", 0.6, 2), &rephrase_suffix);
+        assert!(matches!(outcome, FaultOutcome::YieldToHuman { .. }), "budget spent, still medium -> ask human");
+        assert_eq!(sched.yields, 1);
+        assert_eq!(sched.retries, 0, "no retry was issued past the budget");
+    }
+
+    #[test]
+    fn low_confidence_yields_immediately_with_the_query() {
+        let mut sched = ContextScheduler::new();
+        let outcome = sched.resolve(&fault("用户喜欢靠窗座位吗", 0.2, 0), &rephrase_suffix);
+        match outcome {
+            FaultOutcome::YieldToHuman { question, confidence } => {
+                assert!(question.contains("用户喜欢靠窗座位吗"));
+                assert_eq!(confidence, 0.2);
+            }
+            other => panic!("expected yield, got {other:?}"),
+        }
+        assert_eq!(sched.yields, 1);
+    }
+
+    #[test]
+    fn rephrase_that_changes_nothing_yields_instead_of_looping() {
+        let mut sched = ContextScheduler::new();
+        let identity = |q: &str, _attempt: u32| q.to_string();
+        let outcome = sched.resolve(&fault("用户喜欢靠窗座位吗", 0.6, 0), &identity);
+        assert!(matches!(outcome, FaultOutcome::YieldToHuman { .. }));
+        assert_eq!(sched.retries, 0);
+        let empty = |_q: &str, _attempt: u32| "   ".to_string();
+        let outcome = sched.resolve(&fault("用户喜欢靠窗座位吗", 0.6, 0), &empty);
+        assert!(matches!(outcome, FaultOutcome::YieldToHuman { .. }));
+    }
+
+    #[test]
+    fn nan_confidence_is_treated_as_zero_and_yields() {
+        let mut sched = ContextScheduler::new();
+        assert_eq!(sched.classify(f64::NAN), FaultLevel::Low);
+        let outcome = sched.resolve(&fault("用户喜欢靠窗座位吗", f64::NAN, 0), &rephrase_suffix);
+        assert!(matches!(outcome, FaultOutcome::YieldToHuman { confidence: 0.0, .. }));
+    }
+
+    #[test]
+    fn full_fault_lifecycle_counts_every_outcome() {
+        let mut sched = ContextScheduler::new();
+        sched.resolve(&fault("q1", 0.9, 0), &rephrase_suffix); // direct
+        sched.resolve(&fault("q2", 0.6, 0), &rephrase_suffix); // retry
+        sched.resolve(&fault("q3", 0.1, 0), &rephrase_suffix); // yield
+        sched.resolve(&fault("q4", 0.6, 2), &rephrase_suffix); // yield, budget spent
+        assert_eq!(sched.faults_seen, 4);
+        assert_eq!(sched.direct_uses, 1);
+        assert_eq!(sched.retries, 1);
+        assert_eq!(sched.yields, 2);
     }
 }
