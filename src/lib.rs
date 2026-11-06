@@ -19,6 +19,7 @@ pub mod crypto;
 pub mod delegation;
 pub mod determinization;
 pub mod disclosure;
+pub mod genui;
 pub mod kernel;
 pub mod macro_ecology;
 pub mod memory;
