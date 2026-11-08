@@ -15,6 +15,7 @@ pub mod attention;
 pub mod blackboard;
 pub mod bridge;
 pub mod capabilities;
+pub mod cascade;
 pub mod concurrency;
 pub mod crypto;
 pub mod delegation;
