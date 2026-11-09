@@ -12,6 +12,7 @@
 //! half-lives, cooling-off periods) is deterministically testable.
 
 pub mod attention;
+pub mod benchmark;
 pub mod blackboard;
 pub mod bridge;
 pub mod capabilities;
