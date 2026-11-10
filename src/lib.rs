@@ -30,6 +30,7 @@ pub mod metrics;
 pub mod runtime;
 pub mod schedulers;
 pub mod semantic_prefetch;
+pub mod sensing;
 pub mod speculation;
 pub mod taint;
 pub mod tools;
