@@ -35,6 +35,7 @@ pub mod speculation;
 pub mod taint;
 pub mod tools;
 pub mod transactions;
+pub mod trust;
 pub mod typesys;
 pub mod version_vector;
 pub mod watchdog;
