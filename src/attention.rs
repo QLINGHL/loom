@@ -194,10 +194,22 @@ impl AttentionScheduler {
     /// Feedback: the user responded to an interruption. Additive increase —
     /// in slow start the allowance doubles per response until `ssthresh`,
     /// afterwards it grows linearly (TCP congestion avoidance).
+    ///
+    /// A negative allowance is debt from a P0 overdraw. Doubling it would
+    /// punish the agent for the one interruption it was allowed to make,
+    /// and doubling zero would strand it at zero — so a response while in
+    /// debt retires one unit of debt instead, and once the debt clears
+    /// slow start restarts from the initial allowance.
     pub fn on_responded(&mut self, agent: &str) {
         let max = self.max_allowance;
+        let initial = self.initial_allowance;
         let st = self.state(agent);
-        if st.slow_start {
+        if st.allowance < 0.0 {
+            st.allowance += 1.0;
+            if st.allowance >= 0.0 {
+                st.allowance = initial;
+            }
+        } else if st.slow_start {
             st.allowance = (st.allowance * 2.0).min(max);
             if st.allowance >= st.ssthresh {
                 st.slow_start = false;
@@ -375,6 +387,38 @@ mod tests {
         assert_eq!(sched.request(&req("a", "g", "info", Priority::P3), 0), AttentionDecision::LedgerOnly);
         assert_eq!(sched.flush_digest(), vec!["a:g".to_string()]);
         assert!(sched.flush_digest().is_empty());
+    }
+
+    #[test]
+    fn response_while_in_p0_debt_retires_the_debt_instead_of_doubling_it() {
+        let mut sched = AttentionScheduler::new();
+        // Fresh agent spends its one P0: 1.0 - 5.0 = -4.0 of debt.
+        let d = sched.request(&req("a", "g", "transfer", Priority::P0), 0);
+        assert_eq!(d, AttentionDecision::Immediate);
+        assert_eq!(sched.allowance_of("a"), -4.0);
+        // Each acknowledged interruption retires one unit of debt.
+        sched.on_responded("a");
+        assert_eq!(sched.allowance_of("a"), -3.0);
+        sched.on_responded("a");
+        sched.on_responded("a");
+        sched.on_responded("a");
+        // Debt cleared: slow start restarts from the initial allowance
+        // instead of doubling zero and stranding the agent there.
+        assert_eq!(sched.allowance_of("a"), 1.0);
+        sched.on_responded("a");
+        assert_eq!(sched.allowance_of("a"), 2.0);
+    }
+
+    #[test]
+    fn p0_debt_does_not_block_later_p1_forever() {
+        let mut sched = AttentionScheduler::new();
+        sched.request(&req("a", "g", "transfer", Priority::P0), 0);
+        for _ in 0..4 {
+            sched.on_responded("a"); // retire the -4.0 debt
+        }
+        sched.on_responded("a"); // 1.0 -> 2.0, slow start
+        let d = sched.request(&req("a", "g2", "confirm", Priority::P1), 0);
+        assert_eq!(d, AttentionDecision::Queued);
     }
 
     #[test]
