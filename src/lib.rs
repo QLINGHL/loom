@@ -39,6 +39,7 @@ pub mod tools;
 pub mod transactions;
 pub mod trust;
 pub mod typesys;
+pub mod validation;
 pub mod version_vector;
 pub mod watchdog;
 pub mod worldcache;
