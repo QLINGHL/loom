@@ -16,6 +16,18 @@
 //! * **Admission control** — inference is non-preemptible, so a request
 //!   whose estimated latency exceeds the interactive budget is queued or
 //!   downgraded to the small model instead of being "preempted later".
+//! * **Dynamic precision** — one model keeps two weight copies, 4-bit and
+//!   8-bit; difficulty picks the precision (routine work runs 4-bit,
+//!   demanding reasoning runs 8-bit), so precision is a scheduling
+//!   variable, not a model property. Residency is keyed by
+//!   (model, precision): the 8-bit copy of an already-resident 4-bit
+//!   model still pays a weight reload. An interactive request over
+//!   budget at 8-bit first drops to 4-bit before it drops to the small
+//!   model or queues.
+//! * **Bytes per useful token** — the ch. 2 headline metric: total bytes
+//!   moved divided by tokens actually generated (queued work moves
+//!   nothing and generates nothing), split by precision so the cost of
+//!   running demanding work at 8-bit is visible.
 //! * **Block-boundary yield** — a long background decode is split into
 //!   blocks of N tokens; at each block boundary the scheduler checks
 //!   whether an interactive (higher-priority) request is pending and, if
@@ -36,9 +48,55 @@ pub enum Tier {
     Large,
 }
 
+/// Weight precision of one resident copy of a model (doc ch. 2,
+/// conclusion one: dynamic precision). The same model keeps a 4-bit
+/// copy for routine work and an 8-bit copy for demanding reasoning;
+/// precision is a scheduling variable, not a model property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Precision {
+    FourBit,
+    EightBit,
+}
+
+impl Precision {
+    /// Weight bytes at 8-bit are twice the 4-bit copy (same parameter
+    /// count, twice the bits per weight).
+    pub fn weight_multiplier(self) -> u64 {
+        match self {
+            Precision::FourBit => 1,
+            Precision::EightBit => 2,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Precision::FourBit => "4bit",
+            Precision::EightBit => "8bit",
+        }
+    }
+}
+
+/// How hard the reasoning is. Difficulty — not the model — picks the
+/// precision: routine work runs at 4-bit, demanding reasoning at 8-bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Difficulty {
+    Routine,
+    Demanding,
+}
+
+impl Difficulty {
+    pub fn precision(self) -> Precision {
+        match self {
+            Difficulty::Routine => Precision::FourBit,
+            Difficulty::Demanding => Precision::EightBit,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
     pub name: String,
+    /// Weight bytes of the 4-bit copy; the 8-bit copy is twice that.
     pub weights_bytes: u64,
     pub kv_bytes_per_token: u64,
     pub tier: Tier,
@@ -47,6 +105,13 @@ pub struct ModelInfo {
 impl ModelInfo {
     fn can_serve(&self, needs_large: bool) -> bool {
         !needs_large || self.tier == Tier::Large
+    }
+
+    /// Weight bytes of the copy at `precision`. KV bytes per token are
+    /// held constant in this prototype: only the weight copy is
+    /// precision-switched (doc ch. 2 keeps the two copies per model).
+    pub fn weights_bytes_at(&self, precision: Precision) -> u64 {
+        self.weights_bytes * precision.weight_multiplier()
     }
 }
 
@@ -58,6 +123,7 @@ pub struct InferenceRequest {
     pub prefix: String,
     pub prefix_tokens: u32,
     pub needs_large: bool,
+    pub difficulty: Difficulty,
     pub latency_budget_ms: u64,
 }
 
@@ -68,11 +134,15 @@ pub enum Admission {
     Queued,
     /// Routed to the small resident model to fit the budget.
     Downgraded,
+    /// Ran at 4-bit instead of the requested 8-bit to fit the
+    /// interactive budget. The model did not change, only the precision.
+    PrecisionReduced,
 }
 
 #[derive(Debug, Clone)]
 pub struct RouteDecision {
     pub model: String,
+    pub precision: Precision,
     pub resident_hit: bool,
     pub prefix_hit_tokens: u32,
     pub bytes_moved: u64,
@@ -86,14 +156,27 @@ struct PrefixEntry {
 
 pub struct InferenceScheduler {
     models: Vec<ModelInfo>,
-    /// Resident model names, LRU-first order.
-    resident: Vec<String>,
+    /// Resident (model, precision) copies, LRU-first order. One model
+    /// may hold two slots at once — its 4-bit and 8-bit copies are
+    /// separate residents, each paying its own weight reload.
+    resident: Vec<(String, Precision)>,
     max_resident: usize,
     prefix_cache: HashMap<u64, PrefixEntry>,
     prefix_lru: Vec<u64>,
     prefix_capacity_entries: usize,
     bandwidth_bytes_per_ms: u64,
     pub total_bytes_moved: u64,
+    /// Bytes moved by runs at 4-bit precision (weight reload + KV).
+    /// `bytes_moved_4bit + bytes_moved_8bit == total_bytes_moved`.
+    pub bytes_moved_4bit: u64,
+    /// Bytes moved by runs at 8-bit precision (weight reload + KV).
+    pub bytes_moved_8bit: u64,
+    /// Output tokens actually generated by admitted runs. Queued work
+    /// generates none, so this is the "useful token" denominator.
+    pub useful_tokens: u64,
+    /// Times an interactive request was run at 4-bit instead of 8-bit
+    /// to fit its latency budget.
+    pub precision_reductions: u64,
     pub resident_hits: u64,
     pub resident_requests: u64,
     pub prefix_hits: u64,
@@ -114,6 +197,10 @@ impl InferenceScheduler {
             prefix_capacity_entries: 64,
             bandwidth_bytes_per_ms: bandwidth_bytes_per_ms.max(1),
             total_bytes_moved: 0,
+            bytes_moved_4bit: 0,
+            bytes_moved_8bit: 0,
+            useful_tokens: 0,
+            precision_reductions: 0,
             resident_hits: 0,
             resident_requests: 0,
             prefix_hits: 0,
@@ -122,8 +209,33 @@ impl InferenceScheduler {
         }
     }
 
-    pub fn resident_models(&self) -> &[String] {
+    /// Distinct resident model names (a model holding both precision
+    /// copies still appears once).
+    pub fn resident_models(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for (name, _) in &self.resident {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        names
+    }
+
+    /// Resident (model, precision) copies, LRU-first order.
+    pub fn resident_copies(&self) -> &[(String, Precision)] {
         &self.resident
+    }
+
+    /// The ch. 2 headline metric: bytes moved per useful token
+    /// generated. 0.0 until the first token is generated; queued work
+    /// moves no bytes and generates no tokens, so it cannot inflate
+    /// or deflate the figure.
+    pub fn bytes_per_useful_token(&self) -> f64 {
+        if self.useful_tokens == 0 {
+            0.0
+        } else {
+            self.total_bytes_moved as f64 / self.useful_tokens as f64
+        }
     }
 
     pub fn resident_hit_rate(&self) -> f64 {
@@ -138,26 +250,57 @@ impl InferenceScheduler {
         self.models.iter().find(|m| m.name == name).expect("known model")
     }
 
-    fn touch_resident(&mut self, name: &str) {
-        if let Some(pos) = self.resident.iter().position(|n| n == name) {
-            let n = self.resident.remove(pos);
-            self.resident.push(n);
+    fn touch_resident(&mut self, name: &str, precision: Precision) {
+        if let Some(pos) = self
+            .resident
+            .iter()
+            .position(|(n, p)| n == name && *p == precision)
+        {
+            let entry = self.resident.remove(pos);
+            self.resident.push(entry);
         }
     }
 
-    /// Load a model into the resident set (evicting the LRU model when the
-    /// hard cap of 2 is reached — doc ch. 2, model thrashing defense).
-    /// Returns the weight bytes that had to be moved.
-    fn load(&mut self, name: &str) -> u64 {
-        if self.resident.iter().any(|n| n == name) {
-            self.touch_resident(name);
+    /// Load one (model, precision) copy into the resident set
+    /// (evicting the LRU copy when the hard cap of 2 is reached — doc
+    /// ch. 2, model thrashing defense). Returns the weight bytes that
+    /// had to be moved: 0 when that exact copy is already resident,
+    /// the full copy size otherwise — even when the same model is
+    /// resident at the other precision.
+    fn load(&mut self, name: &str, precision: Precision) -> u64 {
+        if self.resident.iter().any(|(n, p)| n == name && *p == precision) {
+            self.touch_resident(name, precision);
             return 0;
         }
         if self.resident.len() >= self.max_resident {
             self.resident.remove(0);
         }
-        self.resident.push(name.to_string());
-        self.model(name).weights_bytes
+        self.resident.push((name.to_string(), precision));
+        self.model(name).weights_bytes_at(precision)
+    }
+
+    /// Book one admitted run's movement: total, its precision bucket,
+    /// and the useful-token denominator.
+    fn account(&mut self, decision: &RouteDecision, output_tokens: u32) {
+        self.total_bytes_moved += decision.bytes_moved;
+        match decision.precision {
+            Precision::FourBit => self.bytes_moved_4bit += decision.bytes_moved,
+            Precision::EightBit => self.bytes_moved_8bit += decision.bytes_moved,
+        }
+        self.useful_tokens += output_tokens as u64;
+    }
+
+    /// Undo `account` for a run that did not actually happen (queued,
+    /// or replaced by a downgraded run). Resident-set and prefix-cache
+    /// side effects are deliberately left in place: a queued request
+    /// still warms them, as before.
+    fn refund(&mut self, decision: &RouteDecision, output_tokens: u32) {
+        self.total_bytes_moved -= decision.bytes_moved;
+        match decision.precision {
+            Precision::FourBit => self.bytes_moved_4bit -= decision.bytes_moved,
+            Precision::EightBit => self.bytes_moved_8bit -= decision.bytes_moved,
+        }
+        self.useful_tokens -= output_tokens as u64;
     }
 
     fn prefix_key(prefix: &str) -> u64 {
@@ -187,16 +330,20 @@ impl InferenceScheduler {
 
     /// Route one inference request. Deterministic accounting model: bytes
     /// moved = weight reload (if any) + KV bytes for uncached prefix tokens
-    /// and generated tokens; latency = bytes / bandwidth.
+    /// and generated tokens; latency = bytes / bandwidth. Precision is
+    /// picked from the request's difficulty, not from the model.
     pub fn route(&mut self, req: &InferenceRequest) -> RouteDecision {
         self.resident_requests += 1;
-        // 1. Choose a model: resident-and-able beats stronger-but-cold.
+        let precision = req.difficulty.precision();
+        // 1. Choose a model: a resident (model, precision) copy that can
+        // serve beats a stronger-but-cold model. A copy resident at the
+        // other precision does not count: it still needs its own reload.
         let resident_choice = self
             .resident
             .iter()
             .rev()
-            .find(|name| self.model(name).can_serve(req.needs_large))
-            .cloned();
+            .find(|(name, p)| *p == precision && self.model(name).can_serve(req.needs_large))
+            .map(|(name, _)| name.clone());
         let preferred_tier = if req.needs_large { Tier::Large } else { Tier::Small };
         let chosen = match resident_choice {
             Some(name) => name,
@@ -208,38 +355,65 @@ impl InferenceScheduler {
                 .map(|m| m.name.clone())
                 .expect("at least one model must be able to serve"),
         };
-        let was_resident = self.resident.contains(&chosen);
+        let was_resident = self
+            .resident
+            .iter()
+            .any(|(n, p)| n == &chosen && *p == precision);
         if was_resident {
             self.resident_hits += 1;
         }
 
-        let mut decision = self.decide_with(&chosen, was_resident, req);
+        let mut decision = self.decide_with(&chosen, precision, was_resident, req);
 
         // 2. Admission control: interactive requests that cannot fit the
-        //    budget are downgraded (if a smaller resident can serve) or
-        //    queued. Non-interactive work always runs in spare capacity.
+        //    budget degrade in order — first precision (8-bit -> 4-bit,
+        //    same model), then model (small resident model), then queue.
+        //    Non-interactive work always runs in spare capacity.
         if req.interactive && decision.est_latency_ms > req.latency_budget_ms {
+            // 2a. Precision is a scheduling variable: drop to 4-bit and
+            //     re-estimate before giving up on this model.
+            if decision.precision == Precision::EightBit {
+                let was_resident_4bit = self
+                    .resident
+                    .iter()
+                    .any(|(n, p)| n == &chosen && *p == Precision::FourBit);
+                self.refund(&decision, req.output_tokens);
+                let reduced = self.decide_with(&chosen, Precision::FourBit, was_resident_4bit, req);
+                if reduced.est_latency_ms <= req.latency_budget_ms {
+                    self.precision_reductions += 1;
+                    let mut d = reduced;
+                    d.admission = Admission::PrecisionReduced;
+                    return d;
+                }
+                decision = reduced;
+            }
+            // 2b. Model downgrade (only when the request does not need
+            //     the large tier): a resident small model at the current
+            //     precision, so no weight reload is paid.
             let downgrade = self
                 .resident
                 .iter()
                 .rev()
-                .find(|name| {
+                .find(|(name, p)| {
                     let m = self.model(name);
-                    m.tier == Tier::Small && m.can_serve(false) && **name != chosen
+                    *p == decision.precision
+                        && m.tier == Tier::Small
+                        && m.can_serve(false)
+                        && name != &chosen
                 })
-                .cloned();
+                .map(|(name, _)| name.clone());
             match downgrade {
                 Some(small) if !req.needs_large => {
                     // Refund the estimate; only the downgraded run counts.
-                    self.total_bytes_moved -= decision.bytes_moved;
-                    let mut d = self.decide_with(&small, true, req);
+                    self.refund(&decision, req.output_tokens);
+                    let mut d = self.decide_with(&small, decision.precision, true, req);
                     d.admission = Admission::Downgraded;
                     decision = d;
                 }
                 _ => {
                     decision.admission = Admission::Queued;
                     // A queued request has not run: refund its accounting.
-                    self.total_bytes_moved -= decision.bytes_moved;
+                    self.refund(&decision, req.output_tokens);
                     return decision;
                 }
             }
@@ -247,8 +421,14 @@ impl InferenceScheduler {
         decision
     }
 
-    fn decide_with(&mut self, model_name: &str, was_resident: bool, req: &InferenceRequest) -> RouteDecision {
-        let load_bytes = self.load(model_name);
+    fn decide_with(
+        &mut self,
+        model_name: &str,
+        precision: Precision,
+        was_resident: bool,
+        req: &InferenceRequest,
+    ) -> RouteDecision {
+        let load_bytes = self.load(model_name, precision);
         let model = self.model(model_name).clone();
         // Prefix reuse: cached prefix tokens cost no KV movement.
         let key = Self::prefix_key(&req.prefix);
@@ -262,15 +442,17 @@ impl InferenceScheduler {
             model.kv_bytes_per_token * (uncached_prefix + req.output_tokens) as u64;
         let bytes_moved = load_bytes + kv_bytes;
         let est_latency_ms = bytes_moved / self.bandwidth_bytes_per_ms;
-        self.total_bytes_moved += bytes_moved;
-        RouteDecision {
+        let decision = RouteDecision {
             model: model_name.to_string(),
+            precision,
             resident_hit: was_resident,
             prefix_hit_tokens: hit_tokens,
             bytes_moved,
             est_latency_ms,
             admission: Admission::Admitted,
-        }
+        };
+        self.account(&decision, req.output_tokens);
+        decision
     }
 }
 
@@ -712,6 +894,15 @@ mod tests {
     }
 
     fn request(needs_large: bool, interactive: bool, budget_ms: u64) -> InferenceRequest {
+        request_difficulty(needs_large, interactive, budget_ms, Difficulty::Routine)
+    }
+
+    fn request_difficulty(
+        needs_large: bool,
+        interactive: bool,
+        budget_ms: u64,
+        difficulty: Difficulty,
+    ) -> InferenceRequest {
         InferenceRequest {
             agent: "a".into(),
             interactive,
@@ -719,6 +910,7 @@ mod tests {
             prefix: "system prompt v1".into(),
             prefix_tokens: 500,
             needs_large,
+            difficulty,
             latency_budget_ms: budget_ms,
         }
     }
@@ -764,7 +956,7 @@ mod tests {
         // Force-load a third distinct model by requesting large while asking
         // for the mid model through a needs_large route after evicting small:
         // resident-aware routing would reuse large, so evict by direct load.
-        sched.load("mid-8b");
+        sched.load("mid-8b", Precision::EightBit);
         assert_eq!(sched.resident_models().len(), 2);
         assert!(!sched.resident_models().contains(&"small-2b".to_string()), "LRU victim evicted");
     }
@@ -785,7 +977,132 @@ mod tests {
     }
 
     fn chunked_request(output_tokens: u32, interactive: bool) -> InferenceRequest {
-        InferenceRequest { output_tokens, ..request(false, interactive, u64::MAX) }
+        chunked_request_difficulty(output_tokens, interactive, Difficulty::Routine)
+    }
+
+    fn chunked_request_difficulty(
+        output_tokens: u32,
+        interactive: bool,
+        difficulty: Difficulty,
+    ) -> InferenceRequest {
+        InferenceRequest {
+            output_tokens,
+            difficulty,
+            ..request(false, interactive, u64::MAX)
+        }
+    }
+
+    #[test]
+    fn demanding_request_runs_at_8bit_and_pays_double_weights() {
+        let mut sched = InferenceScheduler::new(models(), 1_000_000);
+        let d = sched.route(&request_difficulty(false, false, u64::MAX, Difficulty::Demanding));
+        assert_eq!(d.model, "small-2b");
+        assert_eq!(d.precision, Precision::EightBit);
+        // 2 x 2,000,000 weights (8-bit copy) + (500 prefix + 100 out) * 1,000 KV.
+        assert_eq!(d.bytes_moved, 4_600_000);
+        assert_eq!(sched.bytes_moved_8bit, 4_600_000);
+        assert_eq!(sched.bytes_moved_4bit, 0);
+        assert_eq!(sched.useful_tokens, 100);
+        // Routine work on the same model pays the 4-bit copy instead.
+        // A different prefix keeps the KV cost visible (no prefix hit).
+        let d = sched.route(&InferenceRequest {
+            prefix: "another prompt".into(),
+            ..request(false, false, u64::MAX)
+        });
+        assert_eq!(d.precision, Precision::FourBit);
+        assert_eq!(d.bytes_moved, 2_600_000);
+        assert_eq!(sched.bytes_moved_4bit, 2_600_000);
+    }
+
+    #[test]
+    fn same_model_at_other_precision_still_pays_a_reload() {
+        let mut sched = InferenceScheduler::new(models(), 1_000_000);
+        sched.route(&request(false, false, u64::MAX)); // (small, 4-bit) resident
+        // A different prefix keeps the KV cost visible (no prefix hit).
+        let d = sched.route(&InferenceRequest {
+            prefix: "another prompt".into(),
+            ..request_difficulty(false, false, u64::MAX, Difficulty::Demanding)
+        });
+        assert!(!d.resident_hit, "the 4-bit copy does not stand in for the 8-bit copy");
+        assert_eq!(d.bytes_moved, 4_600_000, "full 8-bit weight reload");
+        assert_eq!(sched.resident_models(), vec!["small-2b".to_string()], "one model, two copies");
+        assert_eq!(sched.resident_copies().len(), 2);
+        assert!(sched.resident_copies().contains(&("small-2b".to_string(), Precision::FourBit)));
+        assert!(sched.resident_copies().contains(&("small-2b".to_string(), Precision::EightBit)));
+    }
+
+    #[test]
+    fn interactive_demanding_over_budget_drops_precision_before_model_or_queue() {
+        let mut sched = InferenceScheduler::new(models(), 1_000_000);
+        // 8-bit: 4,600,000 bytes = 4.6 ms; 4-bit: the 8-bit attempt already
+        // warmed the prefix cache, so 2,000,000 load + 100,000 KV = 2.1 ms.
+        let d = sched.route(&request_difficulty(false, true, 3, Difficulty::Demanding));
+        assert_eq!(d.admission, Admission::PrecisionReduced);
+        assert_eq!(d.model, "small-2b", "same model, only the precision changed");
+        assert_eq!(d.precision, Precision::FourBit);
+        assert_eq!(d.bytes_moved, 2_100_000);
+        assert_eq!(sched.precision_reductions, 1);
+        assert_eq!(sched.bytes_moved_4bit, 2_100_000);
+        assert_eq!(sched.bytes_moved_8bit, 0, "the 8-bit estimate was refunded");
+        assert_eq!(sched.useful_tokens, 100, "only the run that happened counts");
+    }
+
+    #[test]
+    fn precision_reduction_that_still_misses_budget_queues() {
+        let mut sched = InferenceScheduler::new(models(), 1_000_000);
+        // Even 4-bit (2.1 ms after the prefix was warmed) misses a 1 ms
+        // budget; no other small model exists to downgrade to, so the
+        // request queues.
+        let d = sched.route(&request_difficulty(false, true, 1, Difficulty::Demanding));
+        assert_eq!(d.admission, Admission::Queued);
+        assert_eq!(sched.total_bytes_moved, 0);
+        assert_eq!(sched.useful_tokens, 0);
+        assert_eq!(sched.precision_reductions, 0, "a queued run is not a reduction");
+    }
+
+    #[test]
+    fn bytes_per_useful_token_counts_only_admitted_runs() {
+        let mut sched = InferenceScheduler::new(models(), 1_000_000);
+        assert_eq!(sched.bytes_per_useful_token(), 0.0, "no tokens yet");
+        sched.route(&request(false, false, u64::MAX)); // 2,600,000 bytes, 100 tokens
+        assert_eq!(sched.bytes_per_useful_token(), 26_000.0);
+        // A queued interactive request moves nothing and generates nothing.
+        let d = sched.route(&request(true, true, 10));
+        assert_eq!(d.admission, Admission::Queued);
+        assert_eq!(sched.bytes_per_useful_token(), 26_000.0);
+        assert_eq!(sched.useful_tokens, 100);
+        sched.route(&InferenceRequest {
+            prefix: "another prompt".into(),
+            ..request_difficulty(false, false, u64::MAX, Difficulty::Demanding)
+        });
+        // (2,600,000 + 4,600,000) / 200 tokens.
+        assert_eq!(sched.bytes_per_useful_token(), 36_000.0);
+        assert_eq!(
+            sched.bytes_moved_4bit + sched.bytes_moved_8bit,
+            sched.total_bytes_moved,
+            "precision buckets partition the total"
+        );
+    }
+
+    #[test]
+    fn chunked_demanding_job_runs_at_8bit_and_resumes_without_reload() {
+        let mut sched = InferenceScheduler::new(models(), 1_000_000);
+        let mut job = sched.start_chunked(&chunked_request_difficulty(200, false, Difficulty::Demanding));
+        assert!(matches!(
+            sched.run_block(&mut job, 100, false),
+            BlockOutcome::Advanced { generated: 100, remaining: 100 }
+        ));
+        // First block: 2 x 2,000,000 weights + (500 + 100) x 1,000 KV.
+        assert_eq!(sched.total_bytes_moved, 4_600_000);
+        assert_eq!(sched.bytes_moved_8bit, 4_600_000);
+        assert!(sched.resident_copies().contains(&("small-2b".to_string(), Precision::EightBit)));
+        // Second block: only the 100 new output tokens' KV moves.
+        assert!(matches!(
+            sched.run_block(&mut job, 100, false),
+            BlockOutcome::Completed { generated: 200 }
+        ));
+        assert_eq!(sched.total_bytes_moved, 4_700_000);
+        assert_eq!(sched.useful_tokens, 200);
     }
 
     #[test]

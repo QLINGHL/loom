@@ -40,7 +40,7 @@
 | `src/determinization.rs` | 第 4 章 | 确定化引擎：计划缓存 → 意图宏 → 触发器，前置条件与失效降级 |
 | `src/worldcache.rs` | 第 11 章 | 现实缓存：E/M/S/I 状态、工具声明的一致性等级、冲突升级 yield |
 | `src/attention.rs` | 第 14 章 | 注意力拥塞控制：AIMD、慢启动、max-min 公平、中断定价、P0–P3 分级 |
-| `src/schedulers.rs` | 第 9 章 | 推理调度（驻留感知、带宽记账、准入控制）+ 信任调度 + Agent 五类配额 |
+| `src/schedulers.rs` | 第 9 章 / 第 2 章 | 推理调度（驻留感知、带宽记账、准入控制、动态精度、每有用 token 搬运字节）+ 信任调度 + Agent 五类配额 |
 | `src/speculation.rs` | 第 12 章 | 投机执行：四验证谓词、投机预算、不可投机屏障 |
 | `src/watchdog.rs` | 第 16 章 | 失败分类学：无进展指纹看门狗、意图版本化与漂移 diff |
 | `src/tools.rs` | 第 13 章 | 工具注册表：声明式清单、描述哈希钉住（防 Rug Pull）、能力显式传递 |
