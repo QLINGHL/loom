@@ -29,6 +29,7 @@ pub mod kernel;
 pub mod macro_ecology;
 pub mod memory;
 pub mod metrics;
+pub mod resources;
 pub mod runtime;
 pub mod schedulers;
 pub mod semantic_prefetch;
