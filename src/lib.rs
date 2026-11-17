@@ -37,6 +37,7 @@ pub mod sensing;
 pub mod speculation;
 pub mod taint;
 pub mod tools;
+pub mod trace;
 pub mod transactions;
 pub mod trust;
 pub mod typesys;
