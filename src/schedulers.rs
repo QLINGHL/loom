@@ -35,6 +35,7 @@
 //!   once started always runs to completion: there is no mid-block
 //!   preemption, because the NPU cannot be swapped out mid-inference.
 
+use crate::device::{DeviceProfile, DeviceTier};
 use crate::typesys::Risk;
 use std::collections::HashMap;
 
@@ -148,6 +149,12 @@ pub struct RouteDecision {
     pub bytes_moved: u64,
     pub est_latency_ms: u64,
     pub admission: Admission,
+    /// The device budget forced a smaller model or a lower precision
+    /// than the request asked for (doc ch. 2, conclusion three).
+    pub device_limited: bool,
+    /// Low-tier device: the caller must run determinized macros and
+    /// single-step tool calls instead of multi-step planning.
+    pub macro_only: bool,
 }
 
 struct PrefixEntry {
@@ -165,6 +172,10 @@ pub struct InferenceScheduler {
     prefix_lru: Vec<u64>,
     prefix_capacity_entries: usize,
     bandwidth_bytes_per_ms: u64,
+    /// Device budget (doc ch. 2, conclusion three), when set: the tier
+    /// gates which models may run and whether multi-step planning is
+    /// allowed at all. Unset means "no device constraint known".
+    device: Option<DeviceProfile>,
     pub total_bytes_moved: u64,
     /// Bytes moved by runs at 4-bit precision (weight reload + KV).
     /// `bytes_moved_4bit + bytes_moved_8bit == total_bytes_moved`.
@@ -196,6 +207,7 @@ impl InferenceScheduler {
             prefix_lru: Vec::new(),
             prefix_capacity_entries: 64,
             bandwidth_bytes_per_ms: bandwidth_bytes_per_ms.max(1),
+            device: None,
             total_bytes_moved: 0,
             bytes_moved_4bit: 0,
             bytes_moved_8bit: 0,
@@ -207,6 +219,18 @@ impl InferenceScheduler {
             blocks_run: 0,
             block_yields: 0,
         }
+    }
+
+    /// Attach the device budget (doc ch. 2, conclusion three). The
+    /// resident cap follows the tier: a Low device holds only its one
+    /// small model, Mid/High keep the two-copy cap.
+    pub fn set_device_profile(&mut self, profile: DeviceProfile) {
+        self.max_resident = profile.tier().max_resident_models();
+        self.device = Some(profile);
+    }
+
+    pub fn device_profile(&self) -> Option<&DeviceProfile> {
+        self.device.as_ref()
     }
 
     /// Distinct resident model names (a model holding both precision
@@ -334,7 +358,22 @@ impl InferenceScheduler {
     /// picked from the request's difficulty, not from the model.
     pub fn route(&mut self, req: &InferenceRequest) -> RouteDecision {
         self.resident_requests += 1;
-        let precision = req.difficulty.precision();
+        // 0. Device budget (doc ch. 2, conclusion three): a Low-tier
+        //    device never runs the large model and never plans
+        //    multi-step — the decision tells the caller to run macros
+        //    and single-step calls instead.
+        let (needs_large, mut device_limited, macro_only) = match &self.device {
+            Some(profile) => {
+                let low = profile.tier() == DeviceTier::Low;
+                (
+                    req.needs_large && !low,
+                    req.needs_large && low,
+                    !profile.tier().planning_allowed(),
+                )
+            }
+            None => (req.needs_large, false, false),
+        };
+        let mut precision = req.difficulty.precision();
         // 1. Choose a model: a resident (model, precision) copy that can
         // serve beats a stronger-but-cold model. A copy resident at the
         // other precision does not count: it still needs its own reload.
@@ -342,19 +381,48 @@ impl InferenceScheduler {
             .resident
             .iter()
             .rev()
-            .find(|(name, p)| *p == precision && self.model(name).can_serve(req.needs_large))
+            .find(|(name, p)| *p == precision && self.model(name).can_serve(needs_large))
             .map(|(name, _)| name.clone());
-        let preferred_tier = if req.needs_large { Tier::Large } else { Tier::Small };
-        let chosen = match resident_choice {
+        let preferred_tier = if needs_large { Tier::Large } else { Tier::Small };
+        let mut chosen = match resident_choice {
             Some(name) => name,
             None => self
                 .models
                 .iter()
                 .find(|m| m.tier == preferred_tier)
-                .or_else(|| self.models.iter().find(|m| m.can_serve(req.needs_large)))
+                .or_else(|| self.models.iter().find(|m| m.can_serve(needs_large)))
                 .map(|m| m.name.clone())
                 .expect("at least one model must be able to serve"),
         };
+        // 1b. Memory fit: a model that does not fit the device first
+        //     drops precision (8-bit -> 4-bit), then drops to the
+        //     smallest model that fits.
+        if let Some(profile) = &self.device {
+            if !profile.fits(self.model(&chosen), precision) {
+                if profile.fits(self.model(&chosen), Precision::FourBit) {
+                    precision = Precision::FourBit;
+                    device_limited = true;
+                } else if let Some(fallback) =
+                    profile.smallest_fitting(&self.models, Precision::FourBit)
+                {
+                    chosen = fallback.name.clone();
+                    precision = Precision::FourBit;
+                    device_limited = true;
+                } else {
+                    // Nothing fits: still route to the smallest model so
+                    // the caller gets a decision it can report, flagged.
+                    device_limited = true;
+                    if let Some(smallest) = self
+                        .models
+                        .iter()
+                        .min_by_key(|m| m.weights_bytes_at(Precision::FourBit))
+                    {
+                        chosen = smallest.name.clone();
+                        precision = Precision::FourBit;
+                    }
+                }
+            }
+        }
         let was_resident = self
             .resident
             .iter()
@@ -363,7 +431,8 @@ impl InferenceScheduler {
             self.resident_hits += 1;
         }
 
-        let mut decision = self.decide_with(&chosen, precision, was_resident, req);
+        let mut decision =
+            self.decide_with(&chosen, precision, was_resident, req, device_limited, macro_only);
 
         // 2. Admission control: interactive requests that cannot fit the
         //    budget degrade in order — first precision (8-bit -> 4-bit,
@@ -378,7 +447,14 @@ impl InferenceScheduler {
                     .iter()
                     .any(|(n, p)| n == &chosen && *p == Precision::FourBit);
                 self.refund(&decision, req.output_tokens);
-                let reduced = self.decide_with(&chosen, Precision::FourBit, was_resident_4bit, req);
+                let reduced = self.decide_with(
+                    &chosen,
+                    Precision::FourBit,
+                    was_resident_4bit,
+                    req,
+                    device_limited,
+                    macro_only,
+                );
                 if reduced.est_latency_ms <= req.latency_budget_ms {
                     self.precision_reductions += 1;
                     let mut d = reduced;
@@ -403,10 +479,17 @@ impl InferenceScheduler {
                 })
                 .map(|(name, _)| name.clone());
             match downgrade {
-                Some(small) if !req.needs_large => {
+                Some(small) if !needs_large => {
                     // Refund the estimate; only the downgraded run counts.
                     self.refund(&decision, req.output_tokens);
-                    let mut d = self.decide_with(&small, decision.precision, true, req);
+                    let mut d = self.decide_with(
+                        &small,
+                        decision.precision,
+                        true,
+                        req,
+                        device_limited,
+                        macro_only,
+                    );
                     d.admission = Admission::Downgraded;
                     decision = d;
                 }
@@ -427,6 +510,8 @@ impl InferenceScheduler {
         precision: Precision,
         was_resident: bool,
         req: &InferenceRequest,
+        device_limited: bool,
+        macro_only: bool,
     ) -> RouteDecision {
         let load_bytes = self.load(model_name, precision);
         let model = self.model(model_name).clone();
@@ -450,6 +535,8 @@ impl InferenceScheduler {
             bytes_moved,
             est_latency_ms,
             admission: Admission::Admitted,
+            device_limited,
+            macro_only,
         };
         self.account(&decision, req.output_tokens);
         decision
@@ -1334,5 +1421,62 @@ mod tests {
         assert_eq!(sched.direct_uses, 1);
         assert_eq!(sched.retries, 1);
         assert_eq!(sched.yields, 2);
+    }
+
+    // --- Device budget (doc ch. 2, conclusion three) -----------------
+
+    fn realistic_models() -> Vec<ModelInfo> {
+        vec![
+            ModelInfo { name: "small-2b".into(), weights_bytes: 2_000_000_000, kv_bytes_per_token: 1_000, tier: Tier::Small },
+            ModelInfo { name: "large-70b".into(), weights_bytes: 35_000_000_000, kv_bytes_per_token: 4_000, tier: Tier::Large },
+        ]
+    }
+
+    const GB_S_PER_MS: u64 = 1_000_000; // 1 GB/s in bytes/ms.
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn low_tier_device_never_runs_large_and_is_macro_only() {
+        let mut sched = InferenceScheduler::new(realistic_models(), 60 * GB_S_PER_MS);
+        // 4 GiB phone: Low tier.
+        sched.set_device_profile(DeviceProfile::new(4 * GIB, 60 * GB_S_PER_MS, 32_768));
+        let d = sched.route(&request(true, false, u64::MAX));
+        assert_eq!(d.model, "small-2b", "low device must not load the large model");
+        assert!(d.macro_only, "low device must run macros, not multi-step planning");
+        assert!(d.device_limited);
+        // Only the small model ever becomes resident on a Low device.
+        sched.route(&request(false, false, u64::MAX));
+        assert_eq!(sched.resident_models(), vec!["small-2b".to_string()]);
+    }
+
+    #[test]
+    fn mid_tier_device_falls_back_when_large_model_does_not_fit() {
+        let mut sched = InferenceScheduler::new(realistic_models(), 30 * GB_S_PER_MS);
+        // 10 GiB: Mid tier, but the 35 GB large model does not fit.
+        sched.set_device_profile(DeviceProfile::new(10 * GIB, 30 * GB_S_PER_MS, 32_768));
+        let d = sched.route(&request(true, false, u64::MAX));
+        assert_eq!(d.model, "small-2b", "unfitting large model falls back to small");
+        assert!(d.device_limited);
+        assert!(!d.macro_only, "mid tier still allows multi-step planning");
+    }
+
+    #[test]
+    fn high_tier_device_runs_large_model_unchanged() {
+        let mut sched = InferenceScheduler::new(realistic_models(), 60 * GB_S_PER_MS);
+        // 48 GiB / 60 GB/s: High tier, large model fits at 4-bit.
+        sched.set_device_profile(DeviceProfile::new(48 * GIB, 60 * GB_S_PER_MS, 32_768));
+        let d = sched.route(&request(true, false, u64::MAX));
+        assert_eq!(d.model, "large-70b");
+        assert!(!d.device_limited);
+        assert!(!d.macro_only);
+    }
+
+    #[test]
+    fn no_device_profile_means_no_device_limit() {
+        let mut sched = InferenceScheduler::new(models(), 1_000_000);
+        let d = sched.route(&request(true, false, u64::MAX));
+        assert_eq!(d.model, "large-30b");
+        assert!(!d.device_limited);
+        assert!(!d.macro_only);
     }
 }

@@ -20,6 +20,7 @@ pub mod cascade;
 pub mod concurrency;
 pub mod crypto;
 pub mod delegation;
+pub mod device;
 pub mod determinization;
 pub mod disclosure;
 pub mod genui;
