@@ -643,6 +643,234 @@ impl InferenceScheduler {
 }
 
 // ---------------------------------------------------------------------------
+// Reserved real-time channel (doc ch. 2, conclusion two, third leg)
+// ---------------------------------------------------------------------------
+
+/// Outcome of asking the real-time channel whether a request may run
+/// in the current window. Every outcome that defers or rejects a
+/// request consumes nothing, so the request may be retried unchanged
+/// (next window) or after chunking / downgrading it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelDecision {
+    /// Interactive work, running inside its reserved slice.
+    Reserved,
+    /// Interactive work, reserved slice exhausted but idle spare
+    /// capacity available: runs now, borrowed from the spare slice.
+    Borrowed,
+    /// Background work, running inside the spare slice.
+    Spare,
+    /// Interactive work, both slices full: wait for the next window.
+    WaitNextWindow,
+    /// Interactive work larger than the whole window: it can never
+    /// fit one window even by borrowing the entire spare slice. The
+    /// caller must chunk it (doc ch. 9 block-boundary decode) or
+    /// downgrade it before retrying.
+    TooBigForSlice,
+    /// Background work, spare slice exhausted: deferred to the next
+    /// window.
+    Deferred,
+    /// Background work larger than the whole spare slice: it can never
+    /// fit one window and must be chunked before retrying.
+    TooBigForSpare,
+}
+
+/// The reserved real-time channel: the third leg of doc ch. 2,
+/// conclusion two. Inference is non-preemptible — a background decode
+/// already three seconds in cannot be yanked out to serve an
+/// interactive request — so the scheduler cannot rely on preemption
+/// to protect latency. Admission control (`route`) and block-boundary
+/// yield (`run_block`) cover the other two legs; this is the third:
+/// every scheduling window is split into a reserved slice for
+/// interactive work and a spare slice that background work may fill.
+/// Background work never touches the reserved slice, so an
+/// interactive request is never starved by background load;
+/// interactive work that finds its slice exhausted may borrow idle
+/// spare capacity, and the borrow is accounted so the books stay
+/// honest.
+///
+/// The channel is a pure time-budget gate: the caller estimates a
+/// request's latency (e.g. from `RouteDecision::est_latency_ms`) and
+/// asks the channel before starting the decode. A `WaitNextWindow`
+/// for an interactive request is the signal that feeds
+/// `run_block`'s `interactive_pending` flag.
+#[derive(Debug, Clone)]
+pub struct RealtimeChannel {
+    window_ms: u64,
+    reserved_ms: u64,
+    reserved_used_ms: u64,
+    spare_used_ms: u64,
+    /// Interactive milliseconds served from the spare slice this window.
+    borrowed_ms: u64,
+    windows: u64,
+    interactive_waits: u64,
+    background_deferrals: u64,
+    oversized_interactive: u64,
+    oversized_background: u64,
+    total_borrowed_ms: u64,
+}
+
+impl RealtimeChannel {
+    /// `window_ms` is one scheduling window; `reserved_ms` of it is
+    /// reserved for interactive work, the rest is spare capacity for
+    /// background work. Degenerate inputs are clamped, not rejected:
+    /// a window below 1 ms becomes 1 ms, a reserved slice outside
+    /// `1..=window_ms` is clamped into it, so the channel always has
+    /// both a reserved slice and (unless the whole window is
+    /// reserved) a spare slice.
+    pub fn new(window_ms: u64, reserved_ms: u64) -> Self {
+        let window_ms = window_ms.max(1);
+        let reserved_ms = reserved_ms.clamp(1, window_ms);
+        RealtimeChannel {
+            window_ms,
+            reserved_ms,
+            reserved_used_ms: 0,
+            spare_used_ms: 0,
+            borrowed_ms: 0,
+            windows: 0,
+            interactive_waits: 0,
+            background_deferrals: 0,
+            oversized_interactive: 0,
+            oversized_background: 0,
+            total_borrowed_ms: 0,
+        }
+    }
+
+    pub fn window_ms(&self) -> u64 {
+        self.window_ms
+    }
+
+    pub fn reserved_ms(&self) -> u64 {
+        self.reserved_ms
+    }
+
+    /// Spare capacity per window: what background work may fill.
+    pub fn spare_ms(&self) -> u64 {
+        self.window_ms - self.reserved_ms
+    }
+
+    pub fn reserved_used_ms(&self) -> u64 {
+        self.reserved_used_ms
+    }
+
+    pub fn spare_used_ms(&self) -> u64 {
+        self.spare_used_ms
+    }
+
+    /// Interactive milliseconds borrowed from the spare slice in the
+    /// current window.
+    pub fn borrowed_ms(&self) -> u64 {
+        self.borrowed_ms
+    }
+
+    /// Windows completed (each `advance_window` counts one).
+    pub fn windows(&self) -> u64 {
+        self.windows
+    }
+
+    pub fn interactive_waits(&self) -> u64 {
+        self.interactive_waits
+    }
+
+    pub fn background_deferrals(&self) -> u64 {
+        self.background_deferrals
+    }
+
+    pub fn oversized_interactive(&self) -> u64 {
+        self.oversized_interactive
+    }
+
+    pub fn oversized_background(&self) -> u64 {
+        self.oversized_background
+    }
+
+    /// Interactive milliseconds served from spare capacity, all windows.
+    pub fn total_borrowed_ms(&self) -> u64 {
+        self.total_borrowed_ms
+    }
+
+    /// Fraction of the reserved slice already consumed this window.
+    pub fn reserved_utilization(&self) -> f64 {
+        self.reserved_used_ms as f64 / self.reserved_ms as f64
+    }
+
+    /// Fraction of the spare slice already consumed this window
+    /// (reserved + borrowed). 0.0 when the whole window is reserved.
+    pub fn spare_utilization(&self) -> f64 {
+        if self.spare_ms() == 0 {
+            0.0
+        } else {
+            self.spare_used_ms as f64 / self.spare_ms() as f64
+        }
+    }
+
+    /// Dispatch on the request's interactive flag.
+    pub fn admit(&mut self, interactive: bool, est_ms: u64) -> ChannelDecision {
+        if interactive {
+            self.admit_interactive(est_ms)
+        } else {
+            self.admit_background(est_ms)
+        }
+    }
+
+    /// Interactive admission, in order: the reserved slice first,
+    /// then the remainder borrowed from idle spare capacity (a request
+    /// may span both — it runs in the reserved slice and borrows the
+    /// rest), then wait for the next window. A request larger than the
+    /// whole window is rejected outright — it must be chunked or
+    /// downgraded, not waited on, because no future window will fit
+    /// it either.
+    pub fn admit_interactive(&mut self, est_ms: u64) -> ChannelDecision {
+        if est_ms > self.window_ms {
+            self.oversized_interactive += 1;
+            return ChannelDecision::TooBigForSlice;
+        }
+        let reserved_remaining = self.reserved_ms - self.reserved_used_ms;
+        if est_ms <= reserved_remaining {
+            self.reserved_used_ms += est_ms;
+            return ChannelDecision::Reserved;
+        }
+        let spare_remaining = self.spare_ms() - self.spare_used_ms;
+        if est_ms <= reserved_remaining + spare_remaining {
+            let borrowed = est_ms - reserved_remaining;
+            self.reserved_used_ms = self.reserved_ms;
+            self.spare_used_ms += borrowed;
+            self.borrowed_ms += borrowed;
+            self.total_borrowed_ms += borrowed;
+            return ChannelDecision::Borrowed;
+        }
+        self.interactive_waits += 1;
+        ChannelDecision::WaitNextWindow
+    }
+
+    /// Background admission: the spare slice only, never the reserved
+    /// one. A request larger than the whole spare slice is rejected
+    /// outright — it must be chunked, because no future window will
+    /// fit it either.
+    pub fn admit_background(&mut self, est_ms: u64) -> ChannelDecision {
+        if est_ms > self.spare_ms() {
+            self.oversized_background += 1;
+            return ChannelDecision::TooBigForSpare;
+        }
+        if self.spare_used_ms + est_ms <= self.spare_ms() {
+            self.spare_used_ms += est_ms;
+            return ChannelDecision::Spare;
+        }
+        self.background_deferrals += 1;
+        ChannelDecision::Deferred
+    }
+
+    /// Close the current window and open the next: per-window budgets
+    /// reset, cumulative counters (waits, deferrals, borrows, windows)
+    /// are kept.
+    pub fn advance_window(&mut self) {
+        self.reserved_used_ms = 0;
+        self.spare_used_ms = 0;
+        self.borrowed_ms = 0;
+        self.windows += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Trust scheduler: permissions as a gradually granted, revocable resource.
 // ---------------------------------------------------------------------------
 
@@ -1478,5 +1706,138 @@ mod tests {
         assert_eq!(d.model, "large-30b");
         assert!(!d.device_limited);
         assert!(!d.macro_only);
+    }
+
+    // --- Reserved real-time channel (doc ch. 2, conclusion two) ---
+
+    /// Window 1000 ms, reserved slice 400 ms, spare slice 600 ms.
+    fn channel() -> RealtimeChannel {
+        RealtimeChannel::new(1000, 400)
+    }
+
+    #[test]
+    fn interactive_runs_inside_reserved_slice() {
+        let mut ch = channel();
+        assert_eq!(ch.admit_interactive(300), ChannelDecision::Reserved);
+        assert_eq!(ch.admit_interactive(100), ChannelDecision::Reserved);
+        assert_eq!(ch.reserved_used_ms(), 400);
+        assert_eq!(ch.reserved_utilization(), 1.0);
+        assert_eq!(ch.spare_used_ms(), 0, "interactive must not touch spare while reserved remains");
+    }
+
+    #[test]
+    fn interactive_borrows_idle_spare_when_reserved_full() {
+        let mut ch = channel();
+        assert_eq!(ch.admit_interactive(400), ChannelDecision::Reserved);
+        assert_eq!(ch.admit_interactive(200), ChannelDecision::Borrowed);
+        assert_eq!(ch.borrowed_ms(), 200);
+        assert_eq!(ch.total_borrowed_ms(), 200);
+        assert_eq!(ch.spare_used_ms(), 200);
+        assert_eq!(ch.reserved_used_ms(), 400);
+    }
+
+    #[test]
+    fn interactive_waits_when_both_slices_full_then_runs_next_window() {
+        let mut ch = channel();
+        assert_eq!(ch.admit_interactive(400), ChannelDecision::Reserved);
+        assert_eq!(ch.admit_interactive(600), ChannelDecision::Borrowed);
+        assert_eq!(ch.admit_interactive(1), ChannelDecision::WaitNextWindow);
+        assert_eq!(ch.interactive_waits(), 1);
+        assert_eq!(ch.reserved_used_ms(), 400, "a wait consumes nothing");
+        ch.advance_window();
+        assert_eq!(ch.windows(), 1);
+        assert_eq!(ch.reserved_used_ms(), 0);
+        assert_eq!(ch.spare_used_ms(), 0);
+        assert_eq!(ch.borrowed_ms(), 0);
+        assert_eq!(ch.interactive_waits(), 1, "cumulative stats survive the window");
+        assert_eq!(ch.total_borrowed_ms(), 600, "borrow total survives the window");
+        assert_eq!(ch.admit_interactive(400), ChannelDecision::Reserved);
+    }
+
+    #[test]
+    fn oversized_interactive_is_rejected_not_queued() {
+        let mut ch = channel();
+        // 1001 ms can never fit the 1000 ms window, even by borrowing
+        // the entire spare slice: waiting would never help.
+        assert_eq!(ch.admit_interactive(1001), ChannelDecision::TooBigForSlice);
+        assert_eq!(ch.oversized_interactive(), 1);
+        assert_eq!(ch.reserved_used_ms(), 0);
+        assert_eq!(ch.spare_used_ms(), 0);
+        assert_eq!(ch.interactive_waits(), 0);
+        // Just under the window still fits, spanning reserved + borrow.
+        assert_eq!(ch.admit_interactive(1000), ChannelDecision::Borrowed);
+        assert_eq!(ch.reserved_used_ms(), 400);
+        assert_eq!(ch.borrowed_ms(), 600);
+    }
+
+    #[test]
+    fn background_only_fills_spare_and_defers_when_full() {
+        let mut ch = channel();
+        assert_eq!(ch.admit_background(600), ChannelDecision::Spare);
+        assert_eq!(ch.admit_background(1), ChannelDecision::Deferred);
+        assert_eq!(ch.background_deferrals(), 1);
+        assert_eq!(ch.reserved_used_ms(), 0, "background must never touch the reserved slice");
+        // The reserved slice is still fully available afterwards.
+        assert_eq!(ch.admit_interactive(400), ChannelDecision::Reserved);
+    }
+
+    #[test]
+    fn background_never_starves_interactive() {
+        let mut ch = channel();
+        assert_eq!(ch.admit_background(600), ChannelDecision::Spare);
+        // Spare is full, but the reserved slice is untouched.
+        assert_eq!(ch.admit_interactive(400), ChannelDecision::Reserved);
+        // Both slices are now full, so a further interactive request
+        // waits — but it was never displaced by background work.
+        assert_eq!(ch.admit_interactive(1), ChannelDecision::WaitNextWindow);
+    }
+
+    #[test]
+    fn oversized_background_must_be_chunked() {
+        let mut ch = channel();
+        assert_eq!(ch.admit_background(601), ChannelDecision::TooBigForSpare);
+        assert_eq!(ch.oversized_background(), 1);
+        assert_eq!(ch.spare_used_ms(), 0);
+        assert_eq!(ch.background_deferrals(), 0);
+    }
+
+    #[test]
+    fn zero_cost_request_admits_without_consuming() {
+        let mut ch = channel();
+        assert_eq!(ch.admit_interactive(0), ChannelDecision::Reserved);
+        assert_eq!(ch.admit_background(0), ChannelDecision::Spare);
+        assert_eq!(ch.reserved_used_ms(), 0);
+        assert_eq!(ch.spare_used_ms(), 0);
+    }
+
+    #[test]
+    fn admit_dispatches_on_interactive_flag() {
+        let mut ch = channel();
+        assert_eq!(ch.admit(true, 100), ChannelDecision::Reserved);
+        assert_eq!(ch.admit(false, 100), ChannelDecision::Spare);
+    }
+
+    #[test]
+    fn borrowed_spare_is_unavailable_to_later_background() {
+        let mut ch = channel();
+        assert_eq!(ch.admit_interactive(400), ChannelDecision::Reserved);
+        assert_eq!(ch.admit_interactive(500), ChannelDecision::Borrowed);
+        // Only 100 ms of spare remain; a 200 ms background job defers.
+        assert_eq!(ch.admit_background(200), ChannelDecision::Deferred);
+        assert_eq!(ch.admit_background(100), ChannelDecision::Spare);
+    }
+
+    #[test]
+    fn degenerate_window_and_reserved_are_clamped() {
+        let ch = RealtimeChannel::new(0, 0);
+        assert_eq!(ch.window_ms(), 1);
+        assert_eq!(ch.reserved_ms(), 1);
+        assert_eq!(ch.spare_ms(), 0);
+        let ch = RealtimeChannel::new(100, 500);
+        assert_eq!(ch.reserved_ms(), 100, "reserved cannot exceed the window");
+        assert_eq!(ch.spare_ms(), 0);
+        // With no spare slice, background work can never fit.
+        let mut ch = RealtimeChannel::new(100, 500);
+        assert_eq!(ch.admit_background(1), ChannelDecision::TooBigForSpare);
     }
 }
