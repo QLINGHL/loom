@@ -51,6 +51,9 @@ pub enum FailureKind {
     UnsupportedAssertion,
     /// Repeats the same action without progress.
     NoProgressLoop,
+    /// Two agents wait on resources each other holds (doc ch. 16,
+    /// "deadlock detection"; detection itself lives in [`crate::deadlock`]).
+    Deadlock,
     /// Requested a capability it does not hold.
     PrivilegeEscalation,
     /// Plan carries instructions from untrusted content.
@@ -69,6 +72,9 @@ impl FailureKind {
         match self {
             FailureKind::UnsupportedAssertion => "reject output; retry or mark uncertain",
             FailureKind::NoProgressLoop => "abort; switch strategy or escalate to human",
+            FailureKind::Deadlock => {
+                "abort the youngest waiter in the cycle, release its holds, escalate to a human"
+            }
             FailureKind::PrivilegeEscalation => "deterministic deny + ledger entry",
             FailureKind::InjectionContamination => "downgrade plan to needs-confirmation",
             FailureKind::ResourceExhaustion => "preempt, checkpoint, degrade",
@@ -80,6 +86,7 @@ impl FailureKind {
     pub fn cpu_analogy(self) -> &'static str {
         match self {
             FailureKind::NoProgressLoop => "deadlock detection",
+            FailureKind::Deadlock => "deadlock",
             FailureKind::PrivilegeEscalation => "protection fault",
             FailureKind::ResourceExhaustion => "OOM killer",
             FailureKind::WorldChanged => "optimistic-concurrency failure",
