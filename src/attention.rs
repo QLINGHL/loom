@@ -8,6 +8,13 @@
 //!   per acknowledged interruption until it hits a threshold.
 //! * **AIMD** — additive increase while the user keeps responding;
 //!   multiplicative decrease (halve) on rejection or ignore.
+//! * **RTT** — the latency from interruption to response is itself a
+//!   congestion signal: a slow response means the user is busy, so the
+//!   scheduler slows down proactively instead of waiting for a rejection
+//!   or an ignore. Each response updates a per-agent RTT EWMA (exponentially
+//!   weighted moving average); a response slower than the slow-response
+//!   threshold is a multiplicative decrease, a timely one is the usual
+//!   additive increase.
 //! * **Pricing** — interruptions are charged against the agent's allowance
 //!   by priority, so agents learn to coalesce confirmations and prefer
 //!   "act safely, report later" over asking.
@@ -77,6 +84,9 @@ struct AgentState {
     ssthresh: f64,
     slow_start: bool,
     charged_total: f64,
+    /// EWMA of the user's response latency (ms) for this agent's
+    /// interruptions; `None` until the first timed response arrives.
+    rtt_ewma_ms: Option<f64>,
 }
 
 pub struct AttentionScheduler {
@@ -87,6 +97,9 @@ pub struct AttentionScheduler {
     initial_allowance: f64,
     max_allowance: f64,
     silence_ms: u64,
+    /// A response slower than this (ms) means the user is busy: slow down
+    /// proactively instead of waiting for a rejection or an ignore.
+    slow_rtt_ms: u64,
 }
 
 impl AttentionScheduler {
@@ -99,12 +112,30 @@ impl AttentionScheduler {
             initial_allowance: 1.0,
             max_allowance: 16.0,
             silence_ms: 600_000,
+            slow_rtt_ms: 60_000,
         }
     }
 
     pub fn with_silence_ms(mut self, ms: u64) -> Self {
         self.silence_ms = ms;
         self
+    }
+
+    /// Responses slower than `ms` count as "the user is busy" and trigger a
+    /// multiplicative decrease instead of an additive increase.
+    pub fn with_slow_rtt_ms(mut self, ms: u64) -> Self {
+        self.slow_rtt_ms = ms;
+        self
+    }
+
+    /// The scheduler's current slow-response threshold (ms).
+    pub fn slow_rtt_ms(&self) -> u64 {
+        self.slow_rtt_ms
+    }
+
+    /// The agent's current RTT EWMA (ms), if any timed response arrived.
+    pub fn rtt_ewma_ms(&mut self, agent: &str) -> Option<f64> {
+        self.state(agent).rtt_ewma_ms
     }
 
     fn state(&mut self, agent: &str) -> &mut AgentState {
@@ -114,6 +145,7 @@ impl AttentionScheduler {
             ssthresh: 8.0,
             slow_start: true,
             charged_total: 0.0,
+            rtt_ewma_ms: None,
         })
     }
 
@@ -191,16 +223,20 @@ impl AttentionScheduler {
         std::mem::take(&mut self.digest)
     }
 
-    /// Feedback: the user responded to an interruption. Additive increase —
-    /// in slow start the allowance doubles per response until `ssthresh`,
-    /// afterwards it grows linearly (TCP congestion avoidance).
-    ///
-    /// A negative allowance is debt from a P0 overdraw. Doubling it would
-    /// punish the agent for the one interruption it was allowed to make,
-    /// and doubling zero would strand it at zero — so a response while in
-    /// debt retires one unit of debt instead, and once the debt clears
-    /// slow start restarts from the initial allowance.
-    pub fn on_responded(&mut self, agent: &str) {
+    /// Multiplicative decrease (TCP congestion avoidance): halve the
+    /// allowance, drop the slow-start threshold to the new level, and leave
+    /// slow start. Shared by rejection, ignore, and slow-response feedback.
+    fn multiplicative_decrease(&mut self, agent: &str) {
+        let st = self.state(agent);
+        st.allowance /= 2.0;
+        st.ssthresh = st.allowance.max(1.0);
+        st.slow_start = false;
+    }
+
+    /// The additive-increase half of `on_responded`: slow start doubles per
+    /// response until `ssthresh`, afterwards growth is linear. A negative
+    /// allowance is debt from a P0 overdraw — see `on_responded`.
+    fn additive_increase(&mut self, agent: &str) {
         let max = self.max_allowance;
         let initial = self.initial_allowance;
         let st = self.state(agent);
@@ -219,14 +255,57 @@ impl AttentionScheduler {
         }
     }
 
+    /// Feedback: the user responded to an interruption. Additive increase —
+    /// in slow start the allowance doubles per response until `ssthresh`,
+    /// afterwards it grows linearly (TCP congestion avoidance).
+    ///
+    /// A negative allowance is debt from a P0 overdraw. Doubling it would
+    /// punish the agent for the one interruption it was allowed to make,
+    /// and doubling zero would strand it at zero — so a response while in
+    /// debt retires one unit of debt instead, and once the debt clears
+    /// slow start restarts from the initial allowance.
+    ///
+    /// This is the untimed form: the response is assumed timely. Use
+    /// `on_responded_with_latency` when the response latency is known.
+    pub fn on_responded(&mut self, agent: &str) {
+        self.additive_increase(agent);
+    }
+
+    /// Feedback: the user responded after `rtt_ms` milliseconds. The
+    /// latency itself is a congestion signal (doc ch. 14's RTT analogy):
+    /// a slow response means the user is busy, so the scheduler slows down
+    /// proactively — multiplicative decrease, no waiting for a rejection or
+    /// an ignore. A timely response is the usual additive increase.
+    /// Either way the per-agent RTT EWMA is updated (alpha 0.25).
+    ///
+    /// A slow response while the agent is in P0 debt changes nothing: the
+    /// debt is neither deepened nor retired — only timely responses retire
+    /// it, so a busy user never pays for the agent's one urgent
+    /// interruption twice over.
+    pub fn on_responded_with_latency(&mut self, agent: &str, rtt_ms: u64) {
+        let in_debt = {
+            let st = self.state(agent);
+            st.rtt_ewma_ms = Some(match st.rtt_ewma_ms {
+                None => rtt_ms as f64,
+                Some(ewma) => 0.75 * ewma + 0.25 * rtt_ms as f64,
+            });
+            st.allowance < 0.0
+        };
+        if rtt_ms > self.slow_rtt_ms {
+            if in_debt {
+                return; // in P0 debt: a slow response neither deepens nor retires it
+            }
+            self.multiplicative_decrease(agent);
+        } else {
+            self.additive_increase(agent);
+        }
+    }
+
     /// Feedback: the user rejected an interruption of `category`.
     /// Multiplicative decrease + the category goes silent for a while
     /// (during silence, same-category requests default to denied).
     pub fn on_rejected(&mut self, agent: &str, category: &str, now_ms: u64) {
-        let st = self.state(agent);
-        st.allowance /= 2.0;
-        st.ssthresh = st.allowance.max(1.0);
-        st.slow_start = false;
+        self.multiplicative_decrease(agent);
         self.silenced_until
             .insert((agent.to_string(), category.to_string()), now_ms + self.silence_ms);
     }
@@ -234,10 +313,7 @@ impl AttentionScheduler {
     /// Feedback: the user ignored an interruption (an RTT/loss signal: they
     /// are busy). Multiplicative decrease, no silence.
     pub fn on_ignored(&mut self, agent: &str) {
-        let st = self.state(agent);
-        st.allowance /= 2.0;
-        st.ssthresh = st.allowance.max(1.0);
-        st.slow_start = false;
+        self.multiplicative_decrease(agent);
     }
 }
 
@@ -445,5 +521,77 @@ mod tests {
             ("c".into(), 100.0),
         ]);
         assert!(alloc.iter().all(|(_, v)| *v == 3.0));
+    }
+
+    #[test]
+    fn slow_response_halves_allowance_instead_of_increasing() {
+        let mut sched = AttentionScheduler::new();
+        for _ in 0..3 {
+            sched.on_responded("a"); // allowance 8, slow start over
+        }
+        // Default slow threshold is 60_000 ms: a 2-minute response is slow.
+        sched.on_responded_with_latency("a", 120_000);
+        assert_eq!(sched.allowance_of("a"), 4.0);
+        // Slow start is exited: the next timely response adds, not doubles.
+        sched.on_responded_with_latency("a", 1_000);
+        assert_eq!(sched.allowance_of("a"), 5.0);
+    }
+
+    #[test]
+    fn timely_response_via_latency_path_still_increases() {
+        let mut sched = AttentionScheduler::new();
+        sched.on_responded_with_latency("a", 500);
+        assert_eq!(sched.allowance_of("a"), 2.0);
+        sched.on_responded_with_latency("a", 2_000);
+        assert_eq!(sched.allowance_of("a"), 4.0);
+    }
+
+    #[test]
+    fn response_at_the_slow_threshold_counts_as_timely() {
+        let mut sched = AttentionScheduler::new().with_slow_rtt_ms(5_000);
+        sched.on_responded_with_latency("a", 5_000);
+        assert_eq!(sched.allowance_of("a"), 2.0, "exactly at threshold: timely");
+        sched.on_responded_with_latency("a", 5_001);
+        assert_eq!(sched.allowance_of("a"), 1.0, "one ms over: slow, halved");
+    }
+
+    #[test]
+    fn rtt_ewma_tracks_response_latency() {
+        let mut sched = AttentionScheduler::new();
+        assert_eq!(sched.rtt_ewma_ms("a"), None);
+        sched.on_responded_with_latency("a", 1_000);
+        assert_eq!(sched.rtt_ewma_ms("a"), Some(1_000.0));
+        sched.on_responded_with_latency("a", 3_000);
+        // alpha 0.25: 0.75 * 1000 + 0.25 * 3000 = 1500.
+        assert_eq!(sched.rtt_ewma_ms("a"), Some(1_500.0));
+        sched.on_responded_with_latency("a", 1_500);
+        assert_eq!(sched.rtt_ewma_ms("a"), Some(1_500.0));
+    }
+
+    #[test]
+    fn slow_response_during_p0_debt_changes_nothing() {
+        let mut sched = AttentionScheduler::new();
+        sched.request(&req("a", "g", "transfer", Priority::P0), 0);
+        assert_eq!(sched.allowance_of("a"), -4.0);
+        // A slow response neither deepens nor retires the debt.
+        sched.on_responded_with_latency("a", 120_000);
+        assert_eq!(sched.allowance_of("a"), -4.0);
+        // Only timely responses retire it, one unit at a time.
+        sched.on_responded_with_latency("a", 500);
+        assert_eq!(sched.allowance_of("a"), -3.0);
+    }
+
+    #[test]
+    fn repeated_slow_responses_keep_halving_toward_the_floor() {
+        let mut sched = AttentionScheduler::new().with_slow_rtt_ms(5_000);
+        for _ in 0..3 {
+            sched.on_responded("a"); // allowance 8
+        }
+        sched.on_responded_with_latency("a", 60_000);
+        assert_eq!(sched.allowance_of("a"), 4.0);
+        sched.on_responded_with_latency("a", 60_000);
+        assert_eq!(sched.allowance_of("a"), 2.0);
+        // A busy user never gets charged for the slowdown itself.
+        assert_eq!(sched.rtt_ewma_ms("a"), Some(60_000.0));
     }
 }
