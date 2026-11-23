@@ -24,6 +24,7 @@ pub mod delegation;
 pub mod device;
 pub mod determinization;
 pub mod disclosure;
+pub mod drift;
 pub mod genui;
 pub mod injection;
 pub mod intent;
