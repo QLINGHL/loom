@@ -6,7 +6,7 @@
 //! injection being made harmless by structure, not by vigilance.
 
 use loom::capabilities::Scope;
-use loom::determinization::{slot_key, DetEngine};
+use loom::determinization::{slot_key, DetEngine, ServedBy};
 use loom::kernel::{Decision, Kernel, Quotas};
 use loom::memory::{FactCategory, Provenance, SourceKind};
 use loom::runtime::{Executor, ExecOutcome, FakeModel, Planner};
@@ -181,6 +181,9 @@ fn main() {
         let plan = if i == 0 {
             let p = planner.plan("下周去上海出差，帮我把行程排一下", &[Tainted::verified("公司差旅政策 v3".into())]);
             println!("\n[运行 1] 规划器产出计划 IR（{} 步），模型调用累计 {}", p.steps.len(), planner.model_calls());
+            // L0: the model planned it — record the serving rung so the
+            // determinization rate counts this run as model-served.
+            det.record_served(ServedBy::Model);
             p
         } else if let Some(mut cached) = det.lookup_cache("trip.arrange") {
             // L1 hit: reuse the IR, re-bind the date parameter where the
@@ -248,8 +251,9 @@ fn main() {
 
     // -- Summary. -------------------------------------------------------------
     let (total, l1, l2) = det.stats();
+    let rate = det.determination_rate().map(|r| format!("{:.0}%", r * 100.0)).unwrap_or_else(|| "无数据".to_string());
     println!("\n=== 汇总 ===");
-    println!("确定化：记录运行 {total} 次，L1 命中 {l1}，L2 宏命中 {l2}；本次演示模型总调用 {} 次（第 6 次运行为 0）", planner.model_calls());
+    println!("确定化：服务意图 {total} 次（L0 模型 1 次，L1 命中 {l1}，L2 宏命中 {l2}），确定化率 {rate}；本次演示模型总调用 {} 次（第 6 次运行为 0）", planner.model_calls());
     println!("行动账本：{} 条，哈希链完整 = {}", kernel.ledger().len(), kernel.verify_ledger_chain());
     println!("任务 {task} 完成。Loom 的成功标准不是模型被调用了多少次，而是越来越不需要它。");
 }

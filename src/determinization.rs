@@ -12,7 +12,10 @@
 //!   anywhere — this module contains no model handle by construction.
 //! * **L3 triggers** — a macro that ran stably ≥ 20 times may fire
 //!   automatically, but only under an explicit user authorization with a
-//!   hard budget (max runs, max side effects). Exhaustion disables it.
+//!   hard budget (max runs, max side effects), and only while its firing
+//!   conditions hold against current world state. Exhaustion disables it.
+//!   Firing a trigger *runs the macro* and returns its plan: the trigger
+//!   is the automatic path, not a separate permission check.
 //!
 //! Macros must be able to go stale, or the system ossifies:
 //! * every macro carries preconditions — checked before each run; failure
@@ -21,9 +24,17 @@
 //!   recompile queue;
 //! * every macro is bound to the schema versions of its tools — a tool
 //!   interface change invalidates it immediately.
+//!
+//! One canonical determinization statistic (doc ch. 22/23): every served
+//! intent is classified by [`ServedBy`] — L0 model planning, L1 cache,
+//! L2 macro, L3 trigger — and the determinization rate is the share of
+//! served intents that came from a deterministic rung. The P0 acceptance
+//! suite and the metrics dashboard both reuse this definition; the engine
+//! is the only place the classification is made, so the three can never
+//! drift apart.
 
 use crate::crypto::sha256_hex;
-use crate::typesys::{Facts, Plan};
+use crate::typesys::{Condition, Facts, Plan};
 use crate::Clock;
 use crate::Value;
 use std::collections::{HashMap, HashSet};
@@ -56,6 +67,59 @@ pub fn fingerprint(plan: &Plan) -> String {
 /// Key under which a slot value is supplied at macro-run time.
 pub fn slot_key(step_index: usize, path: &str) -> String {
     format!("{step_index}:{path}")
+}
+
+/// How one intent occurrence was served — the single classification
+/// behind the determinization rate (doc ch. 22: "被确定性路径（L1/L2/L3）
+/// 服务的意图占比"). The P0 acceptance suite (ch. 23) and the metrics
+/// dashboard both consume this type; nothing else classifies a serving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ServedBy {
+    /// Full probabilistic path: the model planned it.
+    Model,
+    /// L1 plan cache hit: same structure, parameters re-validated downstream.
+    Cache,
+    /// L2 macro: zero model calls by construction.
+    Macro,
+    /// L3 trigger: a macro fired automatically when its conditions held.
+    Trigger,
+}
+
+impl ServedBy {
+    pub fn is_deterministic(self) -> bool {
+        !matches!(self, ServedBy::Model)
+    }
+}
+
+/// Served-intent counts per rung, as recorded by [`DetEngine`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ServedCounts {
+    pub l0_model: u64,
+    pub l1_cache: u64,
+    pub l2_macro: u64,
+    pub l3_trigger: u64,
+}
+
+impl ServedCounts {
+    pub fn total(self) -> u64 {
+        self.l0_model + self.l1_cache + self.l2_macro + self.l3_trigger
+    }
+
+    pub fn deterministic(self) -> u64 {
+        self.l1_cache + self.l2_macro + self.l3_trigger
+    }
+
+    /// The ch. 22/23 determinization rate: deterministic-served / all
+    /// served. `None` while nothing has been served — no data, never a
+    /// flattering 0% or 100%.
+    pub fn determination_rate(self) -> Option<f64> {
+        let total = self.total();
+        if total == 0 {
+            None
+        } else {
+            Some(self.deterministic() as f64 / total as f64)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -125,6 +189,10 @@ pub struct TriggerBudget {
 #[derive(Debug, Clone)]
 pub struct Trigger {
     pub intent_key: String,
+    /// Firing conditions, evaluated against current world state before
+    /// every automatic run (doc ch. 4: "条件满足即自动执行"). Empty
+    /// means unconditional — the trigger is due whenever it is armed.
+    pub conditions: Vec<Condition>,
     pub budget: TriggerBudget,
     pub used_runs: u32,
     pub used_side_effects: u32,
@@ -138,6 +206,14 @@ pub enum TriggerError {
     InsufficientStability { stable_runs: u32, need: u32 },
     BudgetExhausted,
     NotArmed,
+    /// A firing condition does not hold right now. The trigger is not
+    /// due — this charges no budget and never runs the macro.
+    ConditionNotMet { name: String },
+    /// The macro itself failed to run (precondition, schema drift,
+    /// missing slot). The trigger charges no budget for a run that
+    /// never happened; if the macro demoted or invalidated, the
+    /// trigger is removed with it.
+    MacroFailed(MacroError),
 }
 
 struct Record {
@@ -153,8 +229,11 @@ pub struct DetEngine {
     macros: HashMap<String, Macro>,
     triggers: HashMap<String, Trigger>,
     recompile_queue: Vec<String>,
-    l1_hits: u64,
-    l2_hits: u64,
+    /// Served-intent counts per rung — the single source for the
+    /// determinization rate. L1/L2/L3 are recorded by the engine itself
+    /// when it serves an intent; L0 is recorded by the caller through
+    /// [`DetEngine::record_served`] when the model planned it.
+    served: ServedCounts,
     /// Optional time source. `None` (the `new()` case) keeps the engine
     /// fully deterministic with no wall-clock dependence; macro age is
     /// then unknown and ecology pruning is disabled for those macros.
@@ -169,8 +248,7 @@ impl DetEngine {
             macros: HashMap::new(),
             triggers: HashMap::new(),
             recompile_queue: Vec::new(),
-            l1_hits: 0,
-            l2_hits: 0,
+            served: ServedCounts::default(),
             clock: None,
         }
     }
@@ -240,17 +318,33 @@ impl DetEngine {
         self.records.get(intent_key).map(|r| r.successes).unwrap_or(0)
     }
 
+    /// Record that one intent occurrence was served by `by`. The engine
+    /// calls this itself for the rungs it serves (L1 cache hits in
+    /// [`DetEngine::lookup_cache`], L2 runs in [`DetEngine::run_macro`],
+    /// L3 firings in [`DetEngine::fire_trigger`]); the L0 probabilistic
+    /// path is the caller's responsibility — the model planned it, so
+    /// only the caller knows it happened.
+    pub fn record_served(&mut self, by: ServedBy) {
+        match by {
+            ServedBy::Model => self.served.l0_model += 1,
+            ServedBy::Cache => self.served.l1_cache += 1,
+            ServedBy::Macro => self.served.l2_macro += 1,
+            ServedBy::Trigger => self.served.l3_trigger += 1,
+        }
+    }
+
     // -- L1: plan cache ----------------------------------------------------
 
     /// L1 lookup: a cached plan for this intent kind, only if its
-    /// fingerprint still matches the recorded structure.
+    /// fingerprint still matches the recorded structure. A hit counts
+    /// as one intent served by the L1 rung.
     pub fn lookup_cache(&mut self, intent_key: &str) -> Option<Plan> {
         let (fp, plan) = self.cache.get(intent_key)?;
         if fingerprint(plan) != *fp {
             return None;
         }
         let plan = plan.clone();
-        self.l1_hits += 1;
+        self.record_served(ServedBy::Cache);
         Some(plan)
     }
 
@@ -322,11 +416,27 @@ impl DetEngine {
     /// Execute a macro: verify schema binding, check preconditions, fill
     /// slots, return a concrete plan. There is deliberately no model
     /// parameter — a macro run is zero-model-call *by construction*.
+    /// A successful run counts as one intent served by the L2 rung.
     ///
     /// On precondition failure the caller must fall back to the
     /// probabilistic path. On repeated failure the macro demotes itself
     /// into the recompile queue; on schema drift it invalidates at once.
     pub fn run_macro(
+        &mut self,
+        intent_key: &str,
+        slot_values: &HashMap<String, Value>,
+        facts: &dyn Facts,
+        current_versions: &HashMap<String, u32>,
+    ) -> Result<Plan, MacroError> {
+        let plan = self.run_macro_inner(intent_key, slot_values, facts, current_versions)?;
+        self.record_served(ServedBy::Macro);
+        Ok(plan)
+    }
+
+    /// The macro run itself, without the serving classification — the
+    /// L3 trigger path uses this directly so a trigger firing is
+    /// counted once, as L3, not once as L2 and once as L3.
+    fn run_macro_inner(
         &mut self,
         intent_key: &str,
         slot_values: &HashMap<String, Value>,
@@ -376,7 +486,6 @@ impl DetEngine {
         if let Some(now) = now {
             entry.last_used_ms = Some(now);
         }
-        self.l2_hits += 1;
         Ok(plan)
     }
 
@@ -406,11 +515,14 @@ impl DetEngine {
 
     /// Arm an automatic trigger for a macro. Requires the macro to exist,
     /// ≥ 20 stable macro runs, and the user's *explicit* authorization.
+    /// `conditions` are evaluated against world state before every
+    /// firing — a trigger with an unmet condition is simply not due.
     /// The budget is a hard cap, not a guideline (doc ch. 4).
     pub fn arm_trigger(
         &mut self,
         intent_key: &str,
         explicit_authorization: bool,
+        conditions: Vec<Condition>,
         budget: TriggerBudget,
     ) -> Result<(), TriggerError> {
         if !explicit_authorization {
@@ -425,26 +537,72 @@ impl DetEngine {
         }
         self.triggers.insert(
             intent_key.to_string(),
-            Trigger { intent_key: intent_key.to_string(), budget, used_runs: 0, used_side_effects: 0, enabled: true },
+            Trigger {
+                intent_key: intent_key.to_string(),
+                conditions,
+                budget,
+                used_runs: 0,
+                used_side_effects: 0,
+                enabled: true,
+            },
         );
         Ok(())
     }
 
-    /// Fire an armed trigger, charging its authorization budget.
-    pub fn fire_trigger(&mut self, intent_key: &str, side_effects: u32) -> Result<(), TriggerError> {
-        let trig = self.triggers.get_mut(intent_key).ok_or(TriggerError::NotArmed)?;
-        if !trig.enabled {
-            return Err(TriggerError::BudgetExhausted);
-        }
-        if trig.used_runs + 1 > trig.budget.max_runs
+    /// Is this trigger due right now — armed, enabled, budget headroom,
+    /// and every firing condition holds? Pure query: charges nothing
+    /// and runs nothing, so a scheduler can poll it freely.
+    pub fn trigger_ready(&self, intent_key: &str, facts: &dyn Facts) -> bool {
+        let Some(trig) = self.triggers.get(intent_key) else { return false };
+        trig.enabled
+            && trig.used_runs < trig.budget.max_runs
+            && trig.used_side_effects < trig.budget.max_side_effects
+            && trig.conditions.iter().all(|c| c.eval(facts))
+    }
+
+    /// Fire an armed trigger: check it is due, run its macro, charge the
+    /// authorization budget, and return the macro's plan for execution.
+    /// A condition failure charges nothing and never runs the macro; a
+    /// macro failure charges nothing either — the budget pays only for
+    /// runs that actually happened. If the macro demoted or invalidated
+    /// while firing, the trigger goes with it (no dangling trigger).
+    pub fn fire_trigger(
+        &mut self,
+        intent_key: &str,
+        slot_values: &HashMap<String, Value>,
+        facts: &dyn Facts,
+        current_versions: &HashMap<String, u32>,
+        side_effects: u32,
+    ) -> Result<Plan, TriggerError> {
+        let trig = self.triggers.get(intent_key).ok_or(TriggerError::NotArmed)?;
+        if !trig.enabled
+            || trig.used_runs + 1 > trig.budget.max_runs
             || trig.used_side_effects + side_effects > trig.budget.max_side_effects
         {
-            trig.enabled = false;
+            self.triggers.get_mut(intent_key).expect("checked").enabled = false;
             return Err(TriggerError::BudgetExhausted);
         }
+        for cond in &trig.conditions {
+            if !cond.eval(facts) {
+                return Err(TriggerError::ConditionNotMet { name: cond.name.clone() });
+            }
+        }
+        let plan = match self.run_macro_inner(intent_key, slot_values, facts, current_versions) {
+            Ok(plan) => plan,
+            Err(e) => {
+                // The macro is gone (demoted / schema-invalidated): the
+                // trigger must not outlive it.
+                if !self.macros.contains_key(intent_key) {
+                    self.triggers.remove(intent_key);
+                }
+                return Err(TriggerError::MacroFailed(e));
+            }
+        };
+        let trig = self.triggers.get_mut(intent_key).expect("trigger still armed");
         trig.used_runs += 1;
         trig.used_side_effects += side_effects;
-        Ok(())
+        self.record_served(ServedBy::Trigger);
+        Ok(plan)
     }
 
     pub fn trigger_for(&self, intent_key: &str) -> Option<&Trigger> {
@@ -453,11 +611,27 @@ impl DetEngine {
 
     // -- Metrics -----------------------------------------------------------
 
-    /// (total recorded runs, L1 hits, L2 hits) — the raw counters behind
-    /// the determinization rate of doc ch. 22.
-    pub fn stats(&self) -> (u32, u64, u64) {
-        let total: u32 = self.records.values().map(|r| r.successes).sum();
-        (total, self.l1_hits, self.l2_hits)
+    /// Served counts per rung — the raw counters behind the
+    /// determinization rate (doc ch. 22/23). Same numbers the P0
+    /// acceptance suite and the metrics dashboard report.
+    pub fn served_counts(&self) -> ServedCounts {
+        self.served
+    }
+
+    /// The determinization rate (ch. 22 north-star metric): share of
+    /// served intents that came from a deterministic rung (L1/L2/L3).
+    /// `None` until the first intent is served.
+    pub fn determination_rate(&self) -> Option<f64> {
+        self.served.determination_rate()
+    }
+
+    /// (total served intents, L1 hits, L2 hits) — the served-based
+    /// counters behind the determinization rate. L3 trigger firings
+    /// count in the total (and in [`DetEngine::determination_rate`])
+    /// but are not L1/L2 hits; see [`DetEngine::served_counts`] for
+    /// the per-rung breakdown.
+    pub fn stats(&self) -> (u64, u64, u64) {
+        (self.served.total(), self.served.l1_cache, self.served.l2_macro)
     }
 }
 
@@ -616,7 +790,7 @@ mod tests {
         let budget = TriggerBudget { max_runs: 3, max_side_effects: 10 };
         // Not stable enough yet (0 macro runs).
         assert_eq!(
-            det.arm_trigger(INTENT, true, budget),
+            det.arm_trigger(INTENT, true, vec![], budget),
             Err(TriggerError::InsufficientStability { stable_runs: 0, need: 20 })
         );
         // Run the macro 20 times to stabilize it.
@@ -624,14 +798,117 @@ mod tests {
             det.run_macro(INTENT, &slot_values("2026-12-24"), &free_facts(), &versions()).unwrap();
         }
         // Still needs explicit authorization.
-        assert_eq!(det.arm_trigger(INTENT, false, budget), Err(TriggerError::NotAuthorized));
-        det.arm_trigger(INTENT, true, budget).unwrap();
-        // Fire within budget, then exhaust it.
-        assert!(det.fire_trigger(INTENT, 3).is_ok());
-        assert!(det.fire_trigger(INTENT, 3).is_ok());
-        assert!(det.fire_trigger(INTENT, 3).is_ok());
-        assert_eq!(det.fire_trigger(INTENT, 1), Err(TriggerError::BudgetExhausted));
+        assert_eq!(det.arm_trigger(INTENT, false, vec![], budget), Err(TriggerError::NotAuthorized));
+        det.arm_trigger(INTENT, true, vec![], budget).unwrap();
+        // Fire within budget, then exhaust it. Each firing returns the
+        // macro's plan with slots filled.
+        for _ in 0..3 {
+            let plan = det
+                .fire_trigger(INTENT, &slot_values("2026-12-24"), &free_facts(), &versions(), 3)
+                .unwrap();
+            assert_eq!(plan.steps[0].args.get_path(&["date"]), Some(&Value::text("2026-12-24")));
+        }
+        assert_eq!(
+            det.fire_trigger(INTENT, &slot_values("2026-12-24"), &free_facts(), &versions(), 1),
+            Err(TriggerError::BudgetExhausted)
+        );
         assert!(!det.trigger_for(INTENT).unwrap().enabled);
+        // 20 manual macro runs + 3 trigger firings, all deterministic.
+        assert_eq!(det.served_counts().l2_macro, 20);
+        assert_eq!(det.served_counts().l3_trigger, 3);
+        assert_eq!(det.determination_rate(), Some(1.0));
+    }
+
+    fn stable_engine_with_trigger() -> DetEngine {
+        let mut det = engine_with_macro();
+        for _ in 0..20 {
+            det.run_macro(INTENT, &slot_values("2026-12-24"), &free_facts(), &versions()).unwrap();
+        }
+        det
+    }
+
+    #[test]
+    fn trigger_fires_only_when_its_condition_holds() {
+        let mut det = stable_engine_with_trigger();
+        let condition = Condition::new("inbox has unread", Predicate::Exists("inbox:unread".to_string()));
+        let budget = TriggerBudget { max_runs: 5, max_side_effects: 50 };
+        det.arm_trigger(INTENT, true, vec![condition], budget).unwrap();
+
+        // No unread mail: not due, nothing charged, macro untouched.
+        assert!(!det.trigger_ready(INTENT, &free_facts()));
+        assert_eq!(
+            det.fire_trigger(INTENT, &slot_values("2026-12-24"), &free_facts(), &versions(), 1),
+            Err(TriggerError::ConditionNotMet { name: "inbox has unread".to_string() })
+        );
+        let trig = det.trigger_for(INTENT).unwrap();
+        assert_eq!(trig.used_runs, 0);
+        assert!(trig.enabled);
+        assert_eq!(det.macro_for(INTENT).unwrap().stable_runs, 20);
+
+        // Unread mail arrives: due, fires, returns the plan, charges one run.
+        let facts = free_facts().with_present("inbox:unread");
+        assert!(det.trigger_ready(INTENT, &facts));
+        let plan = det
+            .fire_trigger(INTENT, &slot_values("2026-12-24"), &facts, &versions(), 1)
+            .unwrap();
+        assert_eq!(plan.steps[1].args.get_path(&["date"]), Some(&Value::text("2026-12-24")));
+        assert_eq!(det.trigger_for(INTENT).unwrap().used_runs, 1);
+    }
+
+    #[test]
+    fn trigger_firing_counts_once_as_l3_not_l2() {
+        let mut det = stable_engine_with_trigger();
+        let budget = TriggerBudget { max_runs: 5, max_side_effects: 50 };
+        det.arm_trigger(INTENT, true, vec![], budget).unwrap();
+        det.fire_trigger(INTENT, &slot_values("2026-12-24"), &free_facts(), &versions(), 1)
+            .unwrap();
+        let counts = det.served_counts();
+        assert_eq!(counts.l2_macro, 20, "the 20 stabilizing runs stay L2");
+        assert_eq!(counts.l3_trigger, 1, "the firing is L3, not a second L2");
+        assert_eq!(counts.total(), 21);
+        assert_eq!(det.determination_rate(), Some(1.0));
+        assert_eq!(det.stats(), (21, 0, 20));
+    }
+
+    #[test]
+    fn trigger_dies_with_its_macro_on_schema_drift() {
+        let mut det = stable_engine_with_trigger();
+        let budget = TriggerBudget { max_runs: 5, max_side_effects: 50 };
+        det.arm_trigger(INTENT, true, vec![], budget).unwrap();
+        let mut v2 = versions();
+        v2.insert("cal.write".to_string(), 2);
+        let err = det
+            .fire_trigger(INTENT, &slot_values("2026-12-24"), &free_facts(), &v2, 1)
+            .unwrap_err();
+        assert_eq!(err, TriggerError::MacroFailed(MacroError::SchemaChanged { tool: "cal.write".to_string() }));
+        assert!(det.trigger_for(INTENT).is_none(), "no dangling trigger");
+        assert!(det.macro_for(INTENT).is_none());
+        assert_eq!(det.recompile_queue(), &[INTENT.to_string()]);
+    }
+
+    #[test]
+    fn determination_rate_counts_served_intents_not_recorded_successes() {
+        // No data yet: no rate at all, not 0%.
+        let det = DetEngine::new();
+        assert_eq!(det.determination_rate(), None);
+        assert_eq!(det.stats(), (0, 0, 0));
+
+        // Five recorded successes are *learning*, not serving: they do
+        // not move the rate. (The old stats() counted them as the total,
+        // which could push the rate past 100% once macros ran.)
+        let mut det = engine_with_macro();
+        assert_eq!(det.determination_rate(), None);
+        det.lookup_cache(INTENT).unwrap(); // L1
+        det.run_macro(INTENT, &slot_values("2026-12-24"), &free_facts(), &versions()).unwrap(); // L2
+        assert_eq!(det.determination_rate(), Some(1.0));
+        det.record_served(ServedBy::Model);
+        det.record_served(ServedBy::Model);
+        assert_eq!(det.determination_rate(), Some(0.5));
+        assert_eq!(det.stats(), (4, 1, 1));
+        assert_eq!(
+            det.served_counts(),
+            ServedCounts { l0_model: 2, l1_cache: 1, l2_macro: 1, l3_trigger: 0 }
+        );
     }
 
     #[test]

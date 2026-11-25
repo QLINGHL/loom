@@ -28,6 +28,7 @@
 //! A rate is `None` until its denominator is non-zero: "no data" is
 //! reported as no data, never as a flattering 0% or 100%.
 
+use crate::determinization::ServedBy;
 use crate::kernel::{LedgerEntry, LedgerKind};
 
 /// Doc ch. 22 targets. Determination / first-try / residency are
@@ -135,6 +136,17 @@ impl Metrics {
                 }
             }
         }
+    }
+
+    /// Record that one intent was served by `by` — the determinization
+    /// engine's canonical classification (doc ch. 22/23). This is the
+    /// only way the dashboard's determinization rate is fed: the engine
+    /// classifies, the dashboard counts, so the P0 suite, the engine
+    /// and the dashboard can never disagree on what "deterministic"
+    /// means. Callers that serve through the engine should record the
+    /// same [`ServedBy`] the engine recorded.
+    pub fn record_served(&mut self, by: ServedBy) {
+        self.record(MetricEvent::IntentServed { deterministic: by.is_deterministic() });
     }
 
     /// Fold a kernel ledger into the counters it can honestly feed:
@@ -396,6 +408,18 @@ mod tests {
         m.record(MetricEvent::Interruption { worthwhile: true });
         // 50% false interruptions: far above the 5% ceiling.
         assert_eq!(m.snapshot().false_interrupt_status(), TargetStatus::Missed);
+    }
+
+    #[test]
+    fn served_by_feeds_the_determination_rate() {
+        // Same definition as the engine and the P0 suite: L1/L2/L3 are
+        // deterministic, L0 is not.
+        let mut m = Metrics::new();
+        m.record_served(ServedBy::Model);
+        m.record_served(ServedBy::Cache);
+        m.record_served(ServedBy::Macro);
+        m.record_served(ServedBy::Trigger);
+        approx(m.snapshot().determination_rate, 0.75);
     }
 
     #[test]

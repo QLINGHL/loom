@@ -400,7 +400,7 @@ mod tests {
             engine.run_macro("trip.arrange", &slot_values("2026-12-24"), &free_facts(), &versions()).unwrap();
         }
         engine
-            .arm_trigger("trip.arrange", true, TriggerBudget { max_runs: 100, max_side_effects: 100 })
+            .arm_trigger("trip.arrange", true, vec![], TriggerBudget { max_runs: 100, max_side_effects: 100 })
             .unwrap();
         let rep = report(&engine, 1_000_000 + 365 * DAY, policy());
         assert!(rep.idle_candidates.is_empty());

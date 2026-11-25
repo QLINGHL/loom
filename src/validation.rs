@@ -21,7 +21,7 @@
 //! returns one [`P0Report`] with a single pass/fail verdict.
 
 use crate::attention::{AttentionDecision, AttentionScheduler, InterruptRequest, Priority};
-use crate::determinization::{slot_key, DetEngine};
+use crate::determinization::{slot_key, DetEngine, ServedBy};
 use crate::taint::TrustLabel;
 use crate::typesys::{Effect, FactBase, Plan, PlanStep, TypeChecker};
 use crate::Value;
@@ -38,23 +38,11 @@ pub const INTERCEPTION_TARGET: f64 = 0.999;
 // 1. Determinization climb
 // ---------------------------------------------------------------------------
 
-/// How one intent occurrence was served.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ServedBy {
-    /// Full probabilistic path: the model planned it.
-    Model,
-    /// L1 plan cache hit: same structure, parameters re-validated downstream.
-    Cache,
-    /// L2 macro: zero model calls by construction.
-    Macro,
-}
-
-impl ServedBy {
-    fn is_deterministic(self) -> bool {
-        !matches!(self, ServedBy::Model)
-    }
-}
-
+/// Serving is classified by the determinization engine's canonical
+/// [`ServedBy`]: the trial records which engine path served each intent,
+/// and the engine's own counters must agree with the trial's tally (see
+/// [`determinization_climb`]). No L3 trigger is armed in this trial, but
+/// triggers are deterministic by the same definition.
 /// One intent kind's plan for the climb trial: two steps whose structure is
 /// fixed across repetitions while one leaf (`date`) varies, so the
 /// determinization engine must discover it as a macro slot.
@@ -89,6 +77,11 @@ pub struct ClimbReport {
     /// True when the last window beats the first: the rate climbs.
     pub climbed: bool,
     pub meets_target: bool,
+    /// The engine's own determinization rate over the same run, from
+    /// its served counters. It must equal `deterministic / total` —
+    /// the trial and the engine share one statistical definition, and
+    /// this field is the cross-check that they actually agree.
+    pub engine_rate: Option<f64>,
 }
 
 impl ClimbReport {
@@ -136,7 +129,10 @@ pub fn determinization_climb(kinds: usize, repeats: u32, window: usize) -> Climb
                 }
                 match det.run_macro(&key, &values, &facts, &versions) {
                     Ok(_) => ServedBy::Macro,
-                    Err(_) => ServedBy::Model, // fall back; must not happen in the trial
+                    Err(_) => {
+                        det.record_served(ServedBy::Model);
+                        ServedBy::Model // fall back; must not happen in the trial
+                    }
                 }
             } else if det.lookup_cache(&key).is_some() {
                 det.record_success(&plan, &versions);
@@ -145,6 +141,7 @@ pub fn determinization_climb(kinds: usize, repeats: u32, window: usize) -> Climb
                 }
                 ServedBy::Cache
             } else {
+                det.record_served(ServedBy::Model);
                 det.record_success(&plan, &versions);
                 if det.eligible_for_macro(&key) {
                     let _ = det.compile_macro(&key, true);
@@ -173,6 +170,9 @@ pub fn determinization_climb(kinds: usize, repeats: u32, window: usize) -> Climb
         final_rate,
         climbed,
         meets_target: final_rate >= DETERMINIZATION_TARGET,
+        // Cross-check: the engine counted the same run through its own
+        // served counters — same definition, same numbers.
+        engine_rate: det.determination_rate(),
     }
 }
 
@@ -523,6 +523,9 @@ mod tests {
         assert!(rep.climbed);
         assert!(rep.final_rate >= DETERMINIZATION_TARGET);
         assert!(rep.meets_target);
+        // The engine's own rate over the same run must agree exactly:
+        // one statistical definition, counted once, in the engine.
+        assert_eq!(rep.engine_rate, Some(28.0 / 32.0));
     }
 
     #[test]
