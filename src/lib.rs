@@ -41,6 +41,7 @@ pub mod semantic_prefetch;
 pub mod sensing;
 pub mod speculation;
 pub mod taint;
+pub mod tcb;
 pub mod tools;
 pub mod trace;
 pub mod transactions;
