@@ -36,6 +36,7 @@ pub mod memory;
 pub mod metrics;
 pub mod resources;
 pub mod runtime;
+pub mod safety;
 pub mod schedulers;
 pub mod semantic_prefetch;
 pub mod sensing;

@@ -39,6 +39,10 @@ pub enum DecisionKind {
     Abort,
     /// A determinized macro ran with zero model calls.
     MacroRun,
+    /// A robot safety event: e-stop trigger or reset (safety.rs). The
+    /// e-stop path never consults a model; the kind exists so safety
+    /// history is auditable in the same trace as every other decision.
+    Safety,
 }
 
 impl DecisionKind {
@@ -51,6 +55,7 @@ impl DecisionKind {
             DecisionKind::Commit => "commit",
             DecisionKind::Abort => "abort",
             DecisionKind::MacroRun => "macro_run",
+            DecisionKind::Safety => "safety",
         }
     }
 }
